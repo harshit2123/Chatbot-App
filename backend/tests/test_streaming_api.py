@@ -10,29 +10,14 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-TEST_DATABASE_URL = os.getenv(
-    "TEST_DATABASE_URL", "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/llmlogs_stream"
+from tests.dbutil import ensure_database, url_for
+
+DATABASE_NAME = "llmlogs_stream"
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", url_for(DATABASE_NAME))
+
+pytestmark = pytest.mark.skipif(
+    not ensure_database(DATABASE_NAME), reason="Postgres not reachable at 127.0.0.1:5432"
 )
-
-
-def _postgres_available() -> bool:
-    try:
-        admin = create_engine(
-            "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/postgres",
-            isolation_level="AUTOCOMMIT",
-        )
-        with admin.connect() as conn:
-            exists = conn.execute(
-                text("select 1 from pg_database where datname = 'llmlogs_stream'")
-            ).scalar()
-            if not exists:
-                conn.execute(text("create database llmlogs_stream"))
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(not _postgres_available(), reason="Postgres not reachable")
 
 
 @pytest.fixture(scope="module")

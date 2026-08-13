@@ -14,23 +14,13 @@ import pytest
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
-TEST_DATABASE_URL = os.getenv(
-    "TEST_DATABASE_URL", "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/llmlogs_test"
-)
+from tests.dbutil import ensure_database, url_for
 
-
-def _postgres_available() -> bool:
-    try:
-        engine = create_engine(TEST_DATABASE_URL)
-        with engine.connect() as conn:
-            conn.execute(text("select 1"))
-        return True
-    except Exception:
-        return False
-
+DATABASE_NAME = "llmlogs_worker"
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", url_for(DATABASE_NAME))
 
 pytestmark = pytest.mark.skipif(
-    not _postgres_available(), reason=f"Postgres not reachable at {TEST_DATABASE_URL}"
+    not ensure_database(DATABASE_NAME), reason="Postgres not reachable at 127.0.0.1:5432"
 )
 
 

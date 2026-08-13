@@ -1,12 +1,38 @@
 # LLM Inference Logging & Ingestion System
 
-A multi-turn streaming chatbot where **every model call is instrumented**. Each call
-emits a structured log event — provider, model, latency, token counts, status,
-errors, timestamps, and truncated input/output previews — which is validated,
-queued, PII-redacted, and persisted to Postgres, then surfaced on an observability
-dashboard.
+An **LLM observability platform** with a chatbot attached.
 
-Current state: **Phase 1 and Phase 2 complete** (see [Roadmap](#roadmap)).
+The chatbot is the traffic generator; the system around it is the actual product.
+Every model call is automatically instrumented — provider, model, latency, token
+counts, status, errors, timestamps, and truncated input/output previews are captured,
+validated, queued, PII-redacted, persisted, and surfaced on a dashboard.
+
+The design goal driving every decision below: **telemetry must never degrade the
+product it measures.** Logging cannot slow chat down, cannot break it when the
+database is slow, and cannot be something a developer has to remember to add.
+
+---
+
+## Contents
+
+- [Quick start](#quick-start)
+- [How it maps to the requirements](#how-it-maps-to-the-requirements)
+- [Architecture](#architecture)
+  - [The path of a single message](#the-path-of-a-single-message)
+  - [Component responsibilities](#component-responsibilities)
+  - [Why instrumentation is automatic](#why-instrumentation-is-automatic)
+  - [Why ingestion is decoupled from storage](#why-ingestion-is-decoupled-from-storage)
+  - [Streaming](#streaming)
+  - [Cancellation](#cancellation)
+  - [Failure handling](#failure-handling)
+- [Database schema](#database-schema)
+- [PII redaction](#pii-redaction)
+- [API reference](#api-reference)
+- [Configuration](#configuration)
+- [Using real providers](#using-real-providers)
+- [Testing](#testing)
+- [Known limitations](#known-limitations)
+- [What I would do next](#what-i-would-do-next)
 
 ---
 
@@ -22,11 +48,10 @@ docker compose up --build
 - Dashboard → http://localhost:5173 → "Observability"
 - API docs → http://localhost:8000/docs
 
-Five services come up: `postgres`, `redis`, `backend`, `worker`, `frontend`.
+Five services start: `postgres`, `redis`, `backend`, `worker`, `frontend`.
 
-The default provider is `mock`, which needs no credentials and streams a reply that
-reports how much conversation context it received. To use real models, see
-[Using real providers](#using-real-providers).
+The default provider is `mock` — no credentials, and it streams a reply reporting how
+much conversation context it received, so multi-turn behavior is visible immediately.
 
 **Port conflicts.** Every host port is overridable:
 
@@ -44,173 +69,281 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env
 .venv/bin/uvicorn app.main:app --reload
 
-# Worker, in a second shell, from the repo root
+# Worker, second shell
 cd backend && PYTHONPATH=..:. .venv/bin/celery -A worker.celery_app.celery_app worker --loglevel=info
 
-# Frontend, in a third
+# Frontend, third shell
 cd frontend && npm install && npm run dev
 ```
 
-Set `INGEST_SYNC=true` to skip the queue entirely and write logs inline — useful
-when you want the API without a broker.
+`INGEST_SYNC=true` bypasses the queue entirely and writes logs inline — useful for
+running the API without a broker.
 
-### Tests
+---
 
-```bash
-cd backend && .venv/bin/python -m pytest
-```
+## How it maps to the requirements
 
-59 tests. Test databases are created automatically; Postgres must be reachable.
+| # | Requirement | Implementation |
+|---|---|---|
+| 1 | Multi-turn chatbot, short context, simple UI | React chat with streaming, conversation list, and resume. History trimmed to the last `HISTORY_TURN_LIMIT` messages (default 20) before each call |
+| 2 | SDK capturing inference metadata, **auto-instrumenting** | One wrapper wraps every call. Provider adapters contain zero logging code — a new provider is instrumented for free |
+| 2 | Sends logs in near real time | Pushed over HTTP the moment a call terminates, not batched |
+| 3 | Ingestion: receive → validate → extract → store | `/ingest` receives and validates, then enqueues. The worker extracts, redacts, and stores — the four verbs are genuinely separate stages |
+| 4 | Store messages, logs, extracted metadata | `conversations`, `messages`, `inference_logs`, with metadata in typed columns |
 
-| Suite | Covers |
-|---|---|
-| `test_sdk_logging.py` | Wrapper: success, provider failure, unexpected exception, preview truncation, transport failure, non-2xx delivery |
-| `test_streaming.py` | Stream completion, cancellation with partial output, mid-stream errors, stream/complete parity |
-| `test_pii.py` | Redaction of email/phone/card/SSN/IP, Luhn validation, and **over**-redaction guards |
-| `test_worker.py` | Task persistence, redact-before-write, malformed payloads, redelivery idempotency, broker binding |
-| `test_metrics.py` | Aggregation correctness, fractional error rates, bucket ordering, empty windows |
-| `test_streaming_api.py` | SSE frame sequence, persistence, resume, cancel, 404s, error frames |
-| `test_api.py` | CRUD, multi-turn ordering, validation, ingest idempotency |
+**Bonus items:** multi-provider (verified live), streaming, dashboards, Docker Compose,
+event-based async processing, PII redaction. Self-hosted k8s was deliberately scoped
+out — see [What I would do next](#what-i-would-do-next).
 
 ---
 
 ## Architecture
 
 ```
-React frontend (streaming chat + dashboard)
-      |
-      | SSE
-      v
-FastAPI backend --- get_completion()/stream() ---> Provider adapter (mock | OpenRouter)
-      |                                                   |
-      |                                          SDK wrapper times the call and
-      |                                          builds a log event
-      v                                                   |
-POST /ingest  <-------------------------------------------+
-      |
-      | Pydantic validation, then enqueue (does NOT touch Postgres)
-      v
-Redis broker --> Celery worker: validate -> redact PII -> persist
-                                                   |
-                                                   v
-                                    Postgres (conversations, messages, inference_logs)
-                                                   ^
-                                                   |
-                        /metrics/* aggregation endpoints --> dashboard
+┌─────────────────────────────────────────────────────────────────┐
+│  React frontend                                                  │
+│  chat (SSE) · conversation list · resume · observability charts  │
+└───────────────┬─────────────────────────────────┬───────────────┘
+                │ SSE stream                      │ GET /metrics/*
+                ▼                                 │
+┌─────────────────────────────────────┐           │
+│  FastAPI backend                    │           │
+│                                     │           │
+│  ┌───────────────────────────────┐  │           │
+│  │ SDK wrapper (instrumentation) │  │           │
+│  │  times call, builds log event │  │           │
+│  └──────────────┬────────────────┘  │           │
+│                 │ calls             │           │
+│  ┌──────────────▼────────────────┐  │           │
+│  │ Provider adapter              │──┼──────────────► LLM provider
+│  │  mock │ OpenRouter            │  │           │    (Nvidia, Claude,
+│  │  no logging code inside       │  │           │     GPT, Gemini…)
+│  └───────────────────────────────┘  │           │
+│                                     │           │
+│  POST /ingest ── validate (Pydantic)│           │
+│         │                           │           │
+└─────────┼───────────────────────────┘           │
+          │ enqueue (returns immediately)         │
+          ▼                                       │
+┌─────────────────────┐                           │
+│  Redis (broker)     │                           │
+└─────────┬───────────┘                           │
+          │ consume                               │
+          ▼                                       │
+┌─────────────────────────────────────┐           │
+│  Celery worker                      │           │
+│   validate → redact PII → persist   │           │
+└─────────┬───────────────────────────┘           │
+          │ INSERT ... ON CONFLICT DO NOTHING     │
+          ▼                                       │
+┌─────────────────────────────────────┐           │
+│  Postgres                           │◄──────────┘
+│  conversations · messages           │   SQL aggregation
+│  inference_logs                     │   (avg, p95, error rate)
+└─────────────────────────────────────┘
 ```
 
-### Ingestion flow
+Redis serves two unrelated purposes: Celery's broker, and the store for
+cancellation flags.
 
-1. A chat turn persists the user message, then trims history to the last N messages.
-2. `instrumented_stream()` wraps the provider call, timing it and accumulating output.
-3. When the stream terminates — completed, failed, **or cancelled** — one log event
-   is emitted and POSTed to `/ingest`.
-4. `/ingest` validates with Pydantic and enqueues a Celery task. It never writes to
-   Postgres on the happy path.
-5. The worker redacts PII and writes the row.
+### The path of a single message
 
-**Why decouple.** If Postgres is slow or briefly down, `/ingest` still returns in
-milliseconds and the event waits in the broker. The API's latency is no longer
-coupled to database health.
+1. **User sends a message.** The frontend POSTs to the SSE endpoint with an
+   `AbortController` attached.
+2. **User message is persisted first**, before any model call — so a provider
+   failure can never lose what the user typed.
+3. **Context is trimmed** to the last N messages, newest-first via `LIMIT`, then
+   re-reversed to chronological order.
+4. **The wrapper starts a timer** and calls the provider adapter.
+5. **Tokens stream back.** Each chunk is forwarded to the browser as an SSE `delta`
+   frame and accumulated. Between chunks, the loop checks the cancellation flag.
+6. **The stream terminates** — completed, failed, or cancelled. All three paths emit
+   exactly one log event with the resolved provider/model, latency, tokens, status,
+   and truncated previews.
+7. **The event is POSTed to `/ingest`**, which validates it and enqueues a Celery
+   task. No database write happens on the request path.
+8. **The worker** picks up the task, redacts PII, and inserts idempotently.
+9. **The assistant reply is persisted** and the final SSE frame closes the stream.
+10. **The dashboard** aggregates in Postgres on demand.
 
-### Why the instrumentation is "automatic"
+### Component responsibilities
 
-There is one instrumented call site per mode (blocking and streaming), and both are
-provider-agnostic. Adding a provider means adding one class implementing `complete()`
-and `stream()` in [`providers.py`](backend/app/sdk/providers.py) — no new logging
-code, no API changes, no frontend changes.
+| Component | Owns | Deliberately does not |
+|---|---|---|
+| [`providers.py`](backend/app/sdk/providers.py) | Talking to LLM APIs, normalizing responses | Know that logging exists |
+| [`logging.py`](backend/app/sdk/logging.py) | Timing, metadata capture, log delivery | Know which provider it wraps |
+| [`conversations.py`](backend/app/api/conversations.py) | Chat orchestration, history trimming, SSE | Write log rows |
+| [`ingest.py`](backend/app/api/ingest.py) | Validating and enqueueing log events | Write to Postgres on the happy path |
+| [`tasks.py`](worker/tasks.py) | Redaction, normalization, persistence | Run on the request path |
+| [`metrics.py`](backend/app/api/metrics.py) | SQL aggregation | Aggregate in Python |
 
-### Failure handling
+### Why instrumentation is automatic
 
-| Failure | Behavior |
-|---|---|
-| Malformed log payload | `422` at the endpoint; if it reaches the worker, dropped as `dropped:invalid` rather than retried forever |
-| Worker dies mid-task | `acks_late` + `reject_on_worker_lost` redeliver it; the insert is idempotent on the producer-supplied id, so redelivery cannot double-write |
-| Postgres down | Task retries with backoff (max 3); the event survives in the broker meanwhile |
-| **Broker down** | `/ingest` degrades to a synchronous write rather than dropping the event, and the response reports `queued: false` |
-| LLM call fails | Logged `status=error` with the provider message, surfaced as an SSE `error` frame |
-| Generation cancelled | Logged `status=cancelled` **with partial output**, and the partial reply is persisted so the conversation stays coherent |
-| Ingestion endpoint rejects | Warned and dropped — logging must never break chat. See [Known limitations](#known-limitations) |
+There is **one instrumented call site per mode** (blocking and streaming), and both
+are provider-agnostic. Adding a provider means writing one class with `complete()`
+and `stream()`:
+
+```python
+class AnthropicProvider:
+    name = "anthropic"
+    def complete(self, model, messages) -> CompletionResult: ...
+    def stream(self, model, messages) -> Iterator[StreamChunk]: ...
+```
+
+No logging code. No API changes. No frontend changes. The new provider's calls are
+captured with full metadata automatically.
+
+This matters because **manual instrumentation rots**. Any approach where a developer
+must remember to log at each call site eventually has unlogged call sites. Here,
+forgetting is not possible — the only path to the model runs through the wrapper.
+
+### Why ingestion is decoupled from storage
+
+The naive version writes to Postgres inside the `/ingest` request. That couples your
+chat latency to your database health: a slow or briefly-unavailable Postgres makes
+the product slow, which is exactly backwards for telemetry.
+
+Instead `/ingest` validates and enqueues, returning `202 Accepted` in milliseconds.
+If the database is down, events wait in the broker until a worker drains them.
+
+**Honest framing:** this is queue-based decoupling, **not** a durable replayable
+event log. Kafka or Redis Streams would give replay and event sourcing. Celery was
+chosen for delivery speed and operational familiarity — a real tradeoff, not a claim
+to be Kafka-grade streaming.
+
+### Streaming
+
+Server-Sent Events rather than WebSockets: token streaming is one-directional, and
+SSE needs no connection upgrade or extra protocol handling.
+
+Frames: `start` (persisted user message) → `delta` (token) × N → `done` /
+`cancelled` / `error`.
+
+The frontend uses `fetch` + `ReadableStream` rather than `EventSource`, because
+`EventSource` cannot issue a POST with a JSON body.
 
 ### Cancellation
 
 Two-sided, because either half alone is insufficient:
 
-- **Client**: `AbortController` closes the connection.
-- **Server**: `POST /conversations/{id}/cancel` sets a Redis flag that the streaming
-  loop checks between chunks.
+- **Client:** `AbortController` closes the connection.
+- **Server:** `POST /conversations/{id}/cancel` sets a Redis flag the streaming loop
+  checks between chunks.
 
 Aborting only on the client would leave the server generating tokens into a closed
-socket. The flag lives in Redis rather than process memory so a cancel request that
-lands on a different API worker than the open stream still works — the normal case
-behind a load balancer. It carries a TTL so an abandoned flag cannot cancel a future
-generation.
+socket — still paying for them. The flag lives in Redis rather than process memory so
+a cancel that lands on a **different API worker** than the open stream still works,
+which is the normal case behind a load balancer. It carries a TTL so an abandoned
+flag cannot cancel a future generation.
 
-This stops the stream **between chunks**; it does not abort the upstream provider's
-in-flight HTTP request.
+Partial output is persisted and logged with `status=cancelled`. A cancelled call is
+neither a success nor a failure; folding it into either would distort the error rate.
+
+This stops the stream *between chunks* — it does not abort the provider's in-flight
+HTTP request.
+
+### Failure handling
+
+| Failure | Behavior |
+|---|---|
+| Malformed payload at the endpoint | `422`, nothing enqueued |
+| Malformed payload at the worker | Dropped as `dropped:invalid` — it will never become valid, so retrying would loop forever |
+| Worker dies mid-task | `acks_late` + `reject_on_worker_lost` redeliver it; the idempotent insert makes redelivery safe |
+| Postgres down | Task retries with backoff (max 3); events wait in the broker |
+| **Broker down** | `/ingest` degrades to a synchronous write rather than dropping the event, and reports `queued: false` |
+| LLM call fails | Logged `status=error` with the provider's message, surfaced as an SSE `error` frame |
+| Generation cancelled | Logged `status=cancelled` with partial output preserved |
+| Ingestion endpoint unreachable | Warned and dropped — logging must never break chat. The one non-durable hop; see [Known limitations](#known-limitations) |
 
 ---
 
 ## Database schema
 
-Three tables — see [`models.py`](backend/app/db/models.py): `conversations`,
-`messages`, and `inference_logs` (one row per model call).
+Three tables — [`models.py`](backend/app/db/models.py).
 
-### Schema decisions
+```
+conversations                messages                    inference_logs
+─────────────                ────────                    ──────────────
+id            uuid PK  ┌────►id             uuid PK ┌───►id            uuid PK
+title         text     │     conversation_id fk ────┘    message_id     fk
+status        text     └──── role           text        conversation_id fk
+created_at    tstz           content        text        provider       text
+                             created_at     tstz        model          text
+                                                        latency_ms     int
+                                                        prompt_tokens  int
+                                                        completion_tokens int
+                                                        status         text
+                                                        error_message  text
+                                                        input_preview  text
+                                                        output_preview text
+                                                        started_at     tstz
+                                                        completed_at   tstz
+                                                        created_at     tstz
+```
 
-**Metadata lives in typed columns, not a JSON blob.** The dashboard aggregations
-(`avg(latency_ms)`, `percentile_cont` for p95, error rate per bucket) are plain SQL
-against indexed columns rather than JSON extraction.
+### Schema decisions and tradeoffs
 
-**`id` is supplied by the producer, not the database.** This is what makes ingestion
-idempotent under at-least-once delivery. With `acks_late` enabled, redelivery is
-expected, and the primary-key conflict makes it a no-op.
+**Typed columns, not a JSON blob.** The obvious shortcut is `metadata JSONB`. It
+accepts anything and makes every aggregation painful — the dashboard's
+`avg(latency_ms)`, `percentile_cont(0.95)`, and per-bucket error rates become JSON
+extraction and casting. Typed columns cost a migration when fields change; that cost
+is worth paying for queries that stay simple as volume grows.
 
-**Previews are truncated (500 chars) and redacted, not full payloads.** A deliberate
-storage-and-privacy tradeoff.
+**`id` supplied by the producer, not the database.** This is what makes ingestion
+idempotent. `acks_late` guarantees at-least-once delivery, so redelivery is expected,
+not exceptional — `ON CONFLICT DO NOTHING` on a producer-supplied id turns a duplicate
+into a no-op. A database-generated id would make every redelivery a duplicate row.
 
-**`provider`/`model` record what actually served the request.** An aggregator may
-route elsewhere than requested, so the log stores resolved values — otherwise the
-per-provider dashboard breakdown would be fiction.
+**Truncated, redacted previews rather than full payloads.** Enough to debug a bad
+response, without duplicating entire transcripts into a second table or storing raw
+user data in telemetry. A storage and privacy tradeoff, made deliberately.
 
-**`status` has three values**: `success`, `error`, `cancelled`. Cancelled calls are
-neither successes nor failures, and folding them into either would distort the
-error rate.
+**Resolved provider and model, not requested ones.** An aggregator may route
+elsewhere than asked. Requesting `nvidia/nemotron-3.5-lightning:free` through
+OpenRouter logs `provider = "Nvidia"` — who actually answered. Storing the request
+instead would make the per-provider dashboard fiction.
 
-**`inference_logs` is 1:1 with an assistant message.** Correct for single-shot chat;
-it does not model multi-hop tool-call traces. A known limitation, not an oversight.
+**Three status values: `success`, `error`, `cancelled`.** Cancelled calls are neither.
+Collapsing them into `error` would inflate the error rate with user-initiated stops.
 
-**No `users` table**, since the spec requires no auth. First thing to add for a real
-deployment.
+**`inference_logs` is 1:1 with an assistant message.** Correct for single-shot chat.
+It does not model multi-hop tool-call traces, where one turn produces several model
+calls — that needs a parent trace id and a span model. A known limitation, not an
+oversight.
+
+**No `users` table.** The spec requires no auth. It is the first thing to add for a
+real deployment, and it is why there is no per-user filtering on the dashboard.
 
 ---
 
 ## PII redaction
 
-Applied in the worker, before anything reaches durable storage
+Applied **in the worker, before anything reaches durable storage**
 ([`pii.py`](worker/pii.py)). Covers email, phone (international and NANP), credit
 cards, SSN, and IPv4.
 
-Two design points worth stating:
+Two design points:
 
-- **Card matches are Luhn-validated**, so a 16-digit request id is not mangled into
-  `[REDACTED_CARD]`.
-- **Over-redaction is tested as a failure mode.** Previews exist to debug bad
-  responses; a redactor that eats ordinary prose destroys their value. Tests assert
-  that normal text passes through untouched.
+**Card matches are Luhn-validated.** A naive `\d{13,19}` redacts any long digit run —
+request ids, trace ids, timestamps. Checking the Luhn checksum means real card numbers
+are caught and ordinary identifiers survive.
+
+**Over-redaction is tested as a failure mode.** Previews exist to debug bad responses;
+a redactor that eats normal prose destroys their value. The test suite asserts that
+ordinary text passes through untouched, not just that PII is caught.
 
 **Scope boundary:** redaction applies to `inference_logs` previews — the telemetry
-copy of the data. It does **not** apply to `messages`, which is the user's own chat
-history rendered back to them verbatim. If this system stored logs in a separate
-analytics domain with a broader audience than the chat user, message-level redaction
-would need its own decision.
+copy. It does **not** apply to `messages`, which is the user's own chat history
+rendered back to them verbatim. If logs were shipped to an analytics domain with a
+wider audience than the chat user, message-level redaction would need its own
+decision.
 
 Regexes catch structured identifiers, not names, addresses, or free-form disclosure.
-Presidio would be the upgrade path.
+Presidio is the upgrade path.
 
 ---
 
-## API
+## API reference
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -227,70 +360,154 @@ Presidio would be the upgrade path.
 | GET | `/metrics/errors` | Error rate time series |
 | GET | `/metrics/throughput` | Calls per minute |
 | GET | `/metrics/providers` | Breakdown by provider and model |
+| GET | `/health` | Liveness |
 
-SSE frames: `start`, `delta`, `done`, `cancelled`, `error`.
+---
+
+## Configuration
+
+All via environment variables; see [`.env.example`](backend/.env.example).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | local Postgres | Connection string |
+| `REDIS_URL` | `redis://localhost:6379/0` | Broker and cancellation flags |
+| `LLM_PROVIDER` | `mock` | `mock` or `openrouter` |
+| `LLM_MODEL` | `mock/echo-1` | Model id passed to the provider |
+| `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
+| `INGEST_URL` | `http://127.0.0.1:8000/ingest` | Where the wrapper posts log events |
+| `INGEST_SYNC` | `false` | Bypass the queue, write logs inline |
+| `HISTORY_TURN_LIMIT` | `20` | Context budget in messages |
+| `PREVIEW_MAX_CHARS` | `500` | Preview truncation length |
+| `CANCEL_FLAG_TTL_SECONDS` | `600` | Cancellation flag lifetime |
+| `CORS_ORIGINS` | localhost + 127.0.0.1 :5173 | Allowed browser origins |
+
+`INGEST_URL` uses `127.0.0.1` rather than `localhost` deliberately: on macOS
+`localhost` resolves to `::1` first, so an unrelated process bound to IPv6 `:8000`
+would silently receive the log events instead of this app. That is not hypothetical —
+it happened during development, and every log was being swallowed by another
+container until the wrapper started checking response status.
 
 ---
 
 ## Using real providers
 
 ```bash
-# backend/.env
-LLM_PROVIDER=openrouter
-LLM_MODEL=anthropic/claude-3.5-sonnet
-OPENROUTER_API_KEY=sk-or-...
+export OPENROUTER_API_KEY=sk-or-v1-...
+export LLM_PROVIDER=openrouter
+export LLM_MODEL=nvidia/nemotron-3.5-lightning:free
+docker compose up -d
 ```
 
-OpenRouter routes to Claude, GPT, Gemini, Llama and others by changing `LLM_MODEL`
-alone. Both blocking and streaming paths are implemented against its API.
+OpenRouter is OpenAI-compatible and routes to Claude, GPT, Gemini, Llama, DeepSeek
+and others by changing `LLM_MODEL` alone. Free models carry a `:free` suffix.
 
-**Verification status:** the OpenRouter adapter is verified against real API error
-responses (401 handling confirmed end to end) but has not been run with a valid key,
-so its streaming happy path is tested against a stub rather than live traffic. The
-mock provider's streaming is verified end to end through the browser.
+**Verification status:** verified end to end against live OpenRouter traffic using
+`nvidia/nemotron-3.5-lightning:free` — blocking calls, token-by-token SSE streaming,
+queue processing, and dashboard aggregation all confirmed in the browser. Error
+handling was separately confirmed against a real 401.
+
+Switching providers requires no code change. The logging layer, queue, worker, and
+dashboard are all provider-agnostic.
+
+---
+
+## Testing
+
+```bash
+cd backend && .venv/bin/python -m pytest
+```
+
+**59 tests, no skips.** Each suite creates its own isolated database on demand, so
+the suite runs from a clean machine with only Postgres up.
+
+Two testing decisions worth noting. Suites get **separate databases** so seeded row
+counts stay deterministic when run together, and a `conftest` snapshots the
+environment variables each suite mutates — without that, whichever suite imported
+first won and later suites silently ran against the wrong database. Test databases
+are also **created rather than skipped-if-missing**: a suite that quietly skips when
+its database is absent has stopped protecting anything, which is worse than failing
+loudly.
+
+| Suite | Covers |
+|---|---|
+| `test_sdk_logging.py` | Wrapper: success, provider failure, unexpected exception, preview truncation, transport failure, non-2xx delivery |
+| `test_streaming.py` | Stream completion, cancellation with partial output, mid-stream errors, stream/complete parity |
+| `test_pii.py` | Email/phone/card/SSN/IP redaction, Luhn validation, and **over**-redaction guards |
+| `test_worker.py` | Task persistence, redact-before-write, malformed payloads, redelivery idempotency, broker binding |
+| `test_metrics.py` | Aggregation correctness, fractional error rates, bucket ordering, empty windows |
+| `test_streaming_api.py` | SSE frame sequence, persistence, resume, cancel, 404s, error frames |
+| `test_api.py` | CRUD, multi-turn ordering, validation, ingest idempotency |
+
+Beyond unit and integration tests, the full stack was verified through a real browser
+(Playwright) against both the mock and live providers: incremental token rendering,
+mid-stream cancellation producing a `cancelled` log, resume after reload, dashboard
+rendering, and no console errors at any viewport.
+
+### A bug worth documenting
+
+The queue silently was not being used. `@shared_task` binds to whichever Celery app is
+*current*, and the API only imported `worker.tasks` — so the task attached to Celery's
+**default** app pointing at `localhost`. Every enqueue from the API failed with
+"Connection refused" and fell through to the synchronous fallback.
+
+Redaction and persistence still worked, so the system looked correct end to end. Two
+things caught it: the `queued` flag in the ingest response, and checking the worker's
+logs for task activity rather than trusting that rows appeared in the database.
+
+Fixed by binding the task to the configured app explicitly. There is now a regression
+test asserting the task resolves a real broker URL — the kind of failure that is
+invisible without one.
 
 ---
 
 ## Known limitations
 
-Deliberate scoping calls, not unknowns.
+Deliberate scoping calls, stated plainly rather than hidden.
 
-- **Log delivery from the wrapper is best-effort.** If `/ingest` is unreachable the
+- **The wrapper → `/ingest` hop is best-effort.** If the endpoint is unreachable the
   event is warned and dropped. Everything downstream of `/ingest` is durable; this
-  first hop is not. A local spool would close it.
+  first hop is not. A local disk spool with replay would close it.
 - **No dead-letter queue.** Malformed tasks are logged and dropped.
-- **Celery is a task queue, not a durable replayable event log.** Kafka or Redis
-  Streams is the purer event-driven answer; this is queue-based decoupling, chosen
-  for delivery speed. Stated plainly rather than sold as streaming.
-- **Schema via `create_all()`**, not Alembic migrations.
+- **Celery is a task queue, not a durable replayable event log.**
+- **Schema created via `create_all()`**, not Alembic migrations.
 - **No auth or rate limiting** anywhere, including `/ingest`.
 - **`latency_ms` on streamed calls measures full stream duration.** Time-to-first-token
-  is the more useful streaming metric and is not yet captured.
-- **The frontend image runs the Vite dev server** so `VITE_API_URL` stays runtime-
-  configurable. Production would build the bundle and serve it behind nginx.
+  is the more meaningful streaming metric and is not yet captured — a 17-second stream
+  whose first token arrived in 400ms is currently logged as 17 seconds of latency.
+- **The frontend image runs the Vite dev server** so `VITE_API_URL` stays
+  runtime-configurable. Production would build the bundle and serve it behind nginx.
 
 ---
 
-## Roadmap
+## What I would do next
 
-**Phase 1 — complete**
-Schema · CRUD · multi-turn chat · provider adapters · instrumentation wrapper ·
-validated ingestion · React chat UI with resume · Docker Compose · tests
+In priority order, with reasoning:
 
-**Phase 2 — complete**
-Celery + Redis + worker · PII redaction · SSE streaming · two-sided cancellation ·
-metrics aggregation endpoints · observability dashboard · expanded test suite
-
-**Phase 3 — not started**
-Verified multi-provider runs across Claude/GPT/Gemini · k8s manifests · time-to-first-token ·
-DLQ · Alembic migrations · auth
+1. **Time-to-first-token.** Small change, and it fixes a metric the dashboard
+   currently reports misleadingly for streamed calls.
+2. **Durable local spool for log delivery.** Closes the one remaining place where an
+   event can be lost.
+3. **Alembic migrations.** `create_all()` does not survive the first schema change in
+   production.
+4. **Auth and per-user scoping.** Requires the `users` table, and turns the dashboard
+   into something you could expose to more than one team.
+5. **Kafka or Redis Streams** if replay or event sourcing becomes a requirement. Not
+   before — the queue is sufficient at current scale, and swapping it is contained to
+   one function.
+6. **Kubernetes.** Deliberately skipped: the lowest-signal item for demonstrating the
+   engineering this project is about. The approach would be a Deployment per service,
+   an HPA on worker pods keyed on **queue depth** rather than CPU, secrets from a
+   secret manager rather than env vars, and Postgres/Redis as managed services rather
+   than pods.
 
 ### Scaling notes
 
 Workers scale horizontally — add replicas or raise `--concurrency`; Redis fans tasks
-out automatically. Beyond a single Redis instance, RabbitMQ or Kafka gives durability
-and replay. On k8s, an HPA keyed on queue depth is the natural autoscaling signal.
+out automatically. The API scales behind a load balancer, which the Redis-backed
+cancellation flags already account for.
 
-The next real bottleneck is `inference_logs` growth: the metrics queries scan by
-`created_at`, so a time-based index (and eventually partitioning or rollup tables)
-is what keeps the dashboard fast as volume grows.
+The next real bottleneck is `inference_logs` growth. Metrics queries filter on
+`created_at`, so a time-based index comes first, then partitioning by time, then
+pre-aggregated rollup tables once raw scans stop being viable. The write path scales
+before the read path does, which is the usual shape for telemetry systems.
