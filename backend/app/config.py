@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     cancel_flag_ttl_seconds: int = 600
 
     preview_max_chars: int = 500
+
+    # Durable on-disk spool for log events. Written before delivery is attempted
+    # and cleared on confirmed acceptance, so an ingestion outage or a crash
+    # cannot silently lose telemetry.
+    spool_enabled: bool = True
+    spool_dir: str = "/tmp/llm-log-spool"
+    spool_replay_interval_seconds: int = 30
     # Both spellings of the dev origin: localhost and 127.0.0.1 are distinct
     # origins to the browser, and the Vite dev server is reachable as either.
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

@@ -31,6 +31,7 @@ database is slow, and cannot be something a developer has to remember to add.
 - [Configuration](#configuration)
 - [Using real providers](#using-real-providers)
 - [Testing](#testing)
+- [Verification audit](#verification-audit)
 - [Known limitations](#known-limitations)
 - [What I would do next](#what-i-would-do-next)
 
@@ -520,7 +521,7 @@ dashboard are all provider-agnostic.
 cd backend && .venv/bin/python -m pytest
 ```
 
-**59 tests, no skips.** Each suite creates its own isolated database on demand, so
+**84 tests, no skips.** Each suite creates its own isolated database on demand, so
 the suite runs from a clean machine with only Postgres up.
 
 Two testing decisions worth noting. Suites get **separate databases** so seeded row
@@ -531,15 +532,16 @@ are also **created rather than skipped-if-missing**: a suite that quietly skips 
 its database is absent has stopped protecting anything, which is worse than failing
 loudly.
 
-| Suite | Covers |
-|---|---|
-| `test_sdk_logging.py` | Wrapper: success, provider failure, unexpected exception, preview truncation, transport failure, non-2xx delivery |
-| `test_streaming.py` | Stream completion, cancellation with partial output, mid-stream errors, stream/complete parity |
-| `test_pii.py` | Email/phone/card/SSN/IP redaction, Luhn validation, and **over**-redaction guards |
-| `test_worker.py` | Task persistence, redact-before-write, malformed payloads, redelivery idempotency, broker binding |
-| `test_metrics.py` | Aggregation correctness, fractional error rates, bucket ordering, empty windows |
-| `test_streaming_api.py` | SSE frame sequence, persistence, resume, cancel, 404s, error frames |
-| `test_api.py` | CRUD, multi-turn ordering, validation, ingest idempotency |
+| Suite | Tests | Covers |
+|---|---|---|
+| `test_pii.py` | 18 | Email/phone/card/SSN/IP redaction, Luhn validation, **over**-redaction guards, redaction artifacts |
+| `test_api.py` | 15 | CRUD, rename, delete-keeps-logs, multi-turn ordering, validation, ingest idempotency |
+| `test_providers.py` | 14 | Anthropic vs OpenAI request/response shapes, normalized results, stream parsing, factory resolution |
+| `test_sdk_logging.py` | 8 | Wrapper: success, provider failure, unexpected exception, preview truncation, transport failure, non-2xx delivery, non-blocking delivery |
+| `test_streaming_api.py` | 8 | SSE frame sequence, persistence, resume, cancel, 404s, error frames |
+| `test_streaming.py` | 7 | Stream completion, cancellation with partial output, mid-stream errors, abandoned generators, stream/complete parity |
+| `test_worker.py` | 7 | Task persistence, redact-before-write, malformed payloads, redelivery idempotency, broker binding |
+| `test_metrics.py` | 7 | Aggregation correctness, fractional error rates, bucket ordering, empty windows |
 
 Beyond unit and integration tests, the full stack was verified through a real browser
 (Playwright) against both the mock and live providers: incremental token rendering,
@@ -560,6 +562,163 @@ logs for task activity rather than trusting that rows appeared in the database.
 Fixed by binding the task to the configured app explicitly. There is now a regression
 test asserting the task resolves a real broker URL — the kind of failure that is
 invisible without one.
+
+---
+
+## Verification audit
+
+Every claim in this README was re-checked against the running system rather than
+assumed from the code. This section records what was tested, the observed result,
+and how to reproduce it. Where a claim did **not** hold, that is stated too.
+
+### Automatic instrumentation
+
+The central claim, so it gets a demonstration rather than an assertion: a provider
+class written from scratch, containing **no logging code of any kind**, still
+produces a complete log entry.
+
+```python
+class TotallyNewVendorProvider:
+    name = "acme-labs"
+    def complete(self, model, messages):
+        return CompletionResult(content="hi from acme", provider="acme-labs",
+                                model=model, prompt_tokens=7, completion_tokens=3)
+    def stream(self, model, messages): ...
+```
+
+Captured without modifying anything else:
+
+```
+provider           acme-labs
+model              acme/v1
+latency_ms         0
+prompt_tokens      7
+completion_tokens  3
+status             success
+started_at         2026-08-13T13:00:33.083492+00:00
+```
+
+Supporting evidence: `grep` for logging calls inside
+[`providers.py`](backend/app/sdk/providers.py) and
+[`conversations.py`](backend/app/api/conversations.py) returns **no** matches
+outside docstrings. Neither the provider layer nor the API layer contains
+instrumentation — it lives entirely in the wrapper between them.
+
+### Asynchronous ingestion
+
+The interesting property is not that a row eventually appears, but that it is
+**absent immediately after the endpoint returns**:
+
+```
+POST /ingest  ->  {"accepted":true,"queued":true}
+rows immediately after 202:  0
+rows after the worker ran:   1
+```
+
+Zero rows at the moment of the `202` proves the endpoint does no database work on
+the happy path. Confirmed in code: `ingest_log()` calls `process_log_event.delay()`
+and only touches Postgres via `_write_directly()` in sync mode or broker-down
+fallback.
+
+### Independent scaling
+
+Workers were scaled without touching the API, then 12 events enqueued:
+
+```
+docker compose up -d --scale worker=3 worker
+
+chatbotapp-worker-1 -> 7 tasks
+chatbotapp-worker-2 -> 3 tasks
+chatbotapp-worker-3 -> 3 tasks
+all 12 rows persisted
+```
+
+Work distributed across all three replicas from one Redis queue, with the backend
+untouched. This is what "ingestion and processing scale independently of the chat
+application" means concretely.
+
+### Multi-provider
+
+Three live models through distinct upstream vendors, each logged with the provider
+that actually served the request:
+
+| Requested | Logged provider | Tokens |
+|---|---|---|
+| `nvidia/nemotron-3.5-lightning:free` | `Nvidia` | 21 in / 119 out |
+| `google/gemma-4-26b-a4b-it:free` | `Darkbloom` | 18 in / 2 out |
+| `openai/gpt-oss-20b:free` | `Darkbloom` | 72 in / 41 out |
+
+Plus the Anthropic adapter reaching the real API (invalid key, so a `401
+authentication_error` with a request id — proving endpoint, headers, and body are
+correct and only the credential was rejected). Full detail in
+[Multi-provider: the evidence](#multi-provider-the-evidence).
+
+### Structured storage
+
+`\d inference_logs` shows **15 typed columns** — `uuid`, `integer`, `text`,
+`timestamptz`. A direct query for `json`/`jsonb` columns returns **0**. The metadata
+is queryable SQL, not a blob.
+
+### PII redaction
+
+Verified by reading the row back with raw SQL rather than through the API, so the
+check cannot be fooled by presentation-layer masking:
+
+```
+email [REDACTED_EMAIL] phone [REDACTED_PHONE] card [REDACTED_CARD] ssn [REDACTED_SSN] ip [REDACTED_IP]
+```
+
+### Streaming, dashboards, containerization
+
+- One reply produced **33 `event: delta` frames** — genuinely incremental, not a
+  single buffered write.
+- All five `/metrics/*` endpoints return populated series from real traffic.
+- Five services run under Compose: `postgres`, `redis`, `backend`, `worker`,
+  `frontend`.
+
+### Bugs this audit found
+
+Verification is only worth doing if it can fail. It did, four times:
+
+1. **The queue was silently unused.** `@shared_task` bound to Celery's default app,
+   so every enqueue from the API failed with "Connection refused" and fell back to a
+   synchronous write. Redaction and persistence still worked, so the system looked
+   correct end to end. Caught by inspecting worker logs rather than trusting that
+   rows appeared.
+2. **Log delivery deadlocked on streaming requests.** The wrapper POSTed to an
+   endpoint served by the same single-worker process while that process was busy
+   streaming; the request timed out and the log was lost. Delivery now runs on a
+   background thread pool.
+3. **Two suites silently skipped.** `test_api` and `test_worker` guarded on database
+   reachability and skipped — rather than failed — when their database was missing,
+   so a "59 passed" run was really 43 passed and 16 skipped. Each suite now creates
+   its own database.
+4. **Redaction left cosmetic artifacts.** `+91 98765 43210` produced
+   `+[REDACTED_PHONE]` (stray `+`), and a card followed by text produced
+   `[REDACTED_CARD]ssn` (consumed separator). No PII leaked, but a redactor that
+   visibly mangles text invites doubt about what else it gets wrong.
+
+All four have regression tests. The first two were invisible from the outside, which
+is the point: an observability system that fails silently is the worst possible
+failure mode, and only checking the plumbing — not the output — surfaces it.
+
+### What is *not* verified
+
+- **Kubernetes manifests have never been applied to a cluster.** They are
+  YAML-valid and structurally complete; that is all that can be claimed.
+- **The Anthropic adapter has never received a real 200.** Request shape is
+  confirmed by the live `401`; the success-path response parser is exercised only
+  against stubs.
+- **Client-disconnect logging is unreliable** — see [Known limitations](#known-limitations).
+
+### Reproducing this
+
+```bash
+docker compose up -d --build
+cd backend && .venv/bin/python -m pytest        # 84 tests
+curl -s localhost:8000/metrics/summary?window_minutes=60
+docker compose logs worker | grep succeeded
+```
 
 ---
 

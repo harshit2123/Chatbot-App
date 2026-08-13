@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
-from tests.dbutil import ensure_database, url_for
+from tests.dbutil import ensure_database, reset_schema, url_for
 
 DATABASE_NAME = "llmlogs_worker"
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", url_for(DATABASE_NAME))
@@ -28,10 +28,8 @@ pytestmark = pytest.mark.skipif(
 def session_factory():
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 
-    from app.db.models import Base
-
+    reset_schema(TEST_DATABASE_URL)
     engine = create_engine(TEST_DATABASE_URL)
-    Base.metadata.create_all(bind=engine)
 
     # Point the task's module-level session factory at the test database.
     import worker.tasks as tasks_module

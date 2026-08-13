@@ -8,6 +8,8 @@ anything, which is worse than a hard failure.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from sqlalchemy import create_engine, text
 
 ADMIN_URL = "postgresql+psycopg://postgres:postgres@127.0.0.1:5432/postgres"
@@ -16,6 +18,29 @@ BASE_URL = "postgresql+psycopg://postgres:postgres@127.0.0.1:5432"
 
 def url_for(database: str) -> str:
     return f"{BASE_URL}/{database}"
+
+
+def reset_schema(database_url: str) -> None:
+    """Drop and recreate the schema via Alembic.
+
+    Migrations rather than `create_all()`, so the tests exercise the same DDL
+    path production uses — a migration that fails to apply should fail the test
+    suite, not just the deploy.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    backend_dir = Path(__file__).resolve().parent.parent
+
+    engine = create_engine(database_url, isolation_level="AUTOCOMMIT")
+    with engine.connect() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+
+    config = Config(str(backend_dir / "alembic.ini"))
+    config.set_main_option("script_location", str(backend_dir / "migrations"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "head")
 
 
 def ensure_database(database: str) -> bool:

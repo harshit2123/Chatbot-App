@@ -71,6 +71,10 @@ class InferenceLog(Base):
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str] = mapped_column(Text, nullable=False)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Time to first token. Null for non-streaming calls, where the concept does
+    # not apply — the whole response arrives at once. For streamed calls this is
+    # the number users actually feel; latency_ms measures the full stream.
+    ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False)

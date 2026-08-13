@@ -188,6 +188,64 @@ def test_abandoned_generator_still_emits_exactly_one_log(settings, captured):
     assert captured[0]["error_message"] in {"client disconnected", "stream abandoned"}
 
 
+def test_ttft_is_captured_and_distinct_from_total_latency(settings, captured):
+    """Time-to-first-token is what a user feels; total duration is not.
+
+    A 17s stream whose first token arrived in 400ms was previously logged as
+    17s of "latency", which made streamed calls look far worse than they felt.
+    """
+    import time as time_module
+
+    class SlowFirstToken:
+        name = "slow"
+
+        def complete(self, model, messages):  # pragma: no cover - unused
+            raise NotImplementedError
+
+        def stream(self, model, messages):
+            time_module.sleep(0.2)  # model think time before the first token
+            yield StreamChunk(delta="first", provider=self.name, model=model)
+            time_module.sleep(0.15)  # remaining generation
+            yield StreamChunk(delta=" rest", provider=self.name, model=model)
+            yield StreamChunk(
+                delta="", provider=self.name, model=model, is_final=True,
+                prompt_tokens=2, completion_tokens=2,
+            )
+
+    _run(SlowFirstToken(), settings)
+
+    event = captured[0]
+    assert event["ttft_ms"] is not None
+    assert event["ttft_ms"] >= 150, "should reflect the wait before the first token"
+    # The distinction is the entire point of the metric.
+    assert event["ttft_ms"] < event["latency_ms"]
+
+
+def test_non_streaming_calls_have_no_ttft(settings, captured):
+    """TTFT is meaningless for a blocking call — null, not zero, not latency."""
+    from app.sdk.logging import instrumented_completion
+    from app.sdk.providers import CompletionResult
+
+    class Blocking:
+        name = "blocking"
+
+        def complete(self, model, messages):
+            return CompletionResult(content="hi", provider=self.name, model=model)
+
+        def stream(self, model, messages):  # pragma: no cover - unused
+            raise NotImplementedError
+
+    instrumented_completion(
+        provider=Blocking(),
+        model="m",
+        messages=[ChatMessage(role="user", content="hello")],
+        settings=settings,
+        conversation_id=str(uuid.uuid4()),
+    )
+
+    assert captured[0].get("ttft_ms") is None
+
+
 def test_mock_provider_stream_matches_complete_output(settings):
     """Streaming and non-streaming must not diverge in content."""
     provider = MockProvider()

@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from tests.dbutil import ensure_database, url_for
+from tests.dbutil import ensure_database, reset_schema, url_for
 
 # Isolated database so seeded counts stay deterministic when suites run together.
 DATABASE_NAME = "llmlogs_metrics"
@@ -36,10 +36,9 @@ def client():
     session_module.engine = engine
     session_module.SessionLocal.configure(bind=engine)
 
-    from app.db.models import Base, Conversation, InferenceLog
+    from app.db.models import Conversation, InferenceLog
 
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
+    reset_schema(TEST_DATABASE_URL)
 
     # Seed a known distribution: 8 success + 2 error, latencies 100..1000.
     now = datetime.now(timezone.utc)

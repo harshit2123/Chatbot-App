@@ -21,7 +21,21 @@ _MANAGED_VARS = (
     "INGEST_SYNC",
     "INGEST_URL",
     "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "SPOOL_ENABLED",
+    "SPOOL_DIR",
 )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def disable_spool_by_default():
+    """Keep tests from writing spool files into the real spool directory.
+
+    Suites that exercise the spool set their own `spool_dir` explicitly, so this
+    only affects the ones that do not care about it.
+    """
+    os.environ.setdefault("SPOOL_ENABLED", "false")
+    yield
 
 
 @pytest.fixture(autouse=True, scope="module")

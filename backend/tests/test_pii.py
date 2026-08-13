@@ -58,6 +58,24 @@ def test_phones_are_redacted(phone):
     assert "[REDACTED_PHONE]" in redact(f"call {phone} now")
 
 
+def test_redaction_leaves_no_stray_plus_sign():
+    """Regression: "+91 98765 43210" redacted to "+[REDACTED_PHONE]".
+
+    The optional country-code group failed to match, stranding the leading `+`
+    outside the token. Harmless for privacy, but it advertises a sloppy redactor.
+    """
+    assert redact("phone +91 98765 43210 here") == "phone [REDACTED_PHONE] here"
+
+
+def test_card_redaction_preserves_the_following_separator():
+    """Regression: the card pattern consumed the space after the last digit,
+    producing "[REDACTED_CARD]ssn" and welding the next word onto the token."""
+    result = redact("card 4111 1111 1111 1111 ssn 123-45-6789")
+
+    assert result == "card [REDACTED_CARD] ssn [REDACTED_SSN]"
+    assert "[REDACTED_CARD]ssn" not in result
+
+
 def test_ipv4_is_redacted():
     assert redact("from 192.168.1.44") == "from [REDACTED_IP]"
 

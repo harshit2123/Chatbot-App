@@ -11,13 +11,16 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from datetime import datetime, timezone
 
 import httpx
 
 from app.config import Settings
+from app.sdk.spool import EventSpool
 from app.sdk.providers import (
     ChatMessage,
     CompletionResult,
@@ -49,47 +52,132 @@ def _flatten(messages: list[ChatMessage]) -> str:
 _delivery_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="log-delivery")
 
 
-def _deliver(event: dict, settings: Settings) -> None:
-    """Perform the actual POST. Runs on a delivery thread, never the caller's."""
+_spool: EventSpool | None = None
+
+
+def get_spool(settings: Settings) -> EventSpool | None:
+    """Lazily create the on-disk spool. None when spooling is disabled."""
+    global _spool
+    if not settings.spool_enabled:
+        return None
+    if _spool is None:
+        _spool = EventSpool(Path(settings.spool_dir))
+    return _spool
+
+
+def _post(event: dict, settings: Settings) -> bool:
+    """POST one event. Returns True only on confirmed acceptance."""
     try:
         response = httpx.post(settings.ingest_url, json=event, timeout=INGEST_TIMEOUT_SECONDS)
     except httpx.HTTPError as exc:
         logger.warning("Failed to deliver inference log %s: %s", event.get("id"), exc)
-        return
+        return False
 
-    # A non-2xx is a dropped log, not a delivered one. Without this check a
-    # misrouted endpoint looks identical to success and logs vanish silently.
-    if response.status_code >= 400:
-        logger.warning(
-            "Ingestion endpoint rejected log %s: HTTP %s %s",
+    if response.status_code < 400:
+        return True
+
+    # A 4xx that is not 408/429 means the payload itself is unacceptable —
+    # retrying forever would block the spool behind a permanently bad event.
+    if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
+        logger.error(
+            "Ingestion endpoint permanently rejected log %s: HTTP %s %s",
             event.get("id"),
             response.status_code,
             response.text[:200],
         )
+        return True  # treat as terminal so the spool entry is discarded
+
+    logger.warning(
+        "Ingestion endpoint rejected log %s: HTTP %s %s",
+        event.get("id"),
+        response.status_code,
+        response.text[:200],
+    )
+    return False
+
+
+def _deliver(event: dict, settings: Settings, spooled: Path | None) -> None:
+    """Deliver an event and clear its spool entry on success.
+
+    A failure deliberately leaves the file in place: the replay loop will retry
+    it, and a crash mid-delivery is indistinguishable from a failure, which is
+    the behavior we want.
+    """
+    spool = get_spool(settings)
+    if _post(event, settings) and spool is not None:
+        spool.discard(spooled)
+
+
+def replay_spooled_events(settings: Settings) -> int:
+    """Retry every pending spooled event. Returns the number delivered."""
+    spool = get_spool(settings)
+    if spool is None:
+        return 0
+
+    delivered = 0
+    for path in spool.pending():
+        event = spool.read(path)
+        if event is None:
+            continue  # unreadable; already discarded
+        if _post(event, settings):
+            spool.discard(path)
+            delivered += 1
+        else:
+            # Ingestion is still down. Stop rather than hammering it with the
+            # whole backlog on every pass.
+            break
+
+    if delivered:
+        logger.info("Replayed %d spooled log event(s)", delivered)
+    return delivered
+
+
+def start_replay_worker(settings: Settings) -> threading.Thread | None:
+    """Background loop that drains the spool once ingestion recovers."""
+    if not settings.spool_enabled:
+        return None
+
+    def loop() -> None:
+        while True:
+            time.sleep(settings.spool_replay_interval_seconds)
+            try:
+                replay_spooled_events(settings)
+            except Exception as exc:  # noqa: BLE001 - the loop must never die
+                logger.warning("Spool replay failed: %s", exc)
+
+    # Daemon: replay is best-effort catch-up, never a reason to block shutdown.
+    thread = threading.Thread(target=loop, name="log-spool-replay", daemon=True)
+    thread.start()
+    return thread
 
 
 def emit_log_event(event: dict, settings: Settings) -> None:
-    """Ship a log event to the ingestion endpoint, without blocking the caller.
+    """Persist, then ship a log event — without blocking the caller.
 
-    Delivery is dispatched to a background thread. This is not just an
-    optimization: the wrapper POSTs to an endpoint served by this same process,
-    and doing that synchronously from inside a streaming request deadlocks —
-    the single worker is busy serving the stream and cannot answer itself, so
-    the POST times out and the log is lost. That failure is invisible without
-    checking server logs, which is exactly the blind spot this system exists to
-    prevent.
+    Two failure modes are handled, and they are different:
 
-    Logging must never break chat, so transport failures are swallowed and
-    recorded locally. An ingestion outage still drops observability data; a
-    durable local spool would close that gap. See README future work.
+    1. **Delivery must not block chat.** The wrapper POSTs to an endpoint served
+       by this same process; doing that synchronously from inside a streaming
+       request deadlocks, since the worker busy streaming cannot answer itself.
+       Delivery therefore runs on a background thread.
+
+    2. **Delivery must not lose data.** The event is written to a durable
+       on-disk spool *before* the POST is attempted, and removed only once the
+       endpoint confirms acceptance. If ingestion is down, the process crashes,
+       or the machine loses power, the event is still on disk and the replay
+       loop picks it up. Without this, an ingestion outage silently discarded
+       observability data — the exact blind spot this system exists to prevent.
     """
+    spool = get_spool(settings)
+    spooled = spool.write(event) if spool is not None else None
+
     try:
-        _delivery_pool.submit(_deliver, event, settings)
+        _delivery_pool.submit(_deliver, event, settings, spooled)
     except RuntimeError as exc:
-        # Pool shut down (interpreter exiting). Fall back to a direct send so a
-        # log emitted during shutdown is not silently discarded.
+        # Pool shut down (interpreter exiting). Send inline so a log emitted
+        # during shutdown is not left for a replay that may never run.
         logger.debug("Delivery pool unavailable, sending inline: %s", exc)
-        _deliver(event, settings)
+        _deliver(event, settings, spooled)
 
 
 def instrumented_completion(
@@ -186,6 +274,10 @@ def instrumented_stream(
     resolved_model = model
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # Set once, on the first token that reaches the caller. This is the latency
+    # a user perceives on a streamed reply; total duration is a throughput
+    # number, not a responsiveness one.
+    ttft_ms: int | None = None
 
     def build_event(**overrides) -> dict:
         base = {
@@ -195,6 +287,7 @@ def instrumented_stream(
             "provider": resolved_provider,
             "model": resolved_model,
             "latency_ms": int((time.perf_counter() - start) * 1000),
+            "ttft_ms": ttft_ms,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "status": "success",
@@ -224,6 +317,9 @@ def instrumented_stream(
                 emitted = True
                 emit_log_event(build_event(status=STATUS_CANCELLED), settings)
                 return
+
+            if ttft_ms is None:
+                ttft_ms = int((time.perf_counter() - start) * 1000)
 
             collected.append(chunk.delta)
             yield chunk

@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 
-from tests.dbutil import ensure_database, url_for
+from tests.dbutil import ensure_database, reset_schema, url_for
 
 DATABASE_NAME = "llmlogs_stream"
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", url_for(DATABASE_NAME))
@@ -37,12 +37,10 @@ def client():
     session_module.engine = engine
     session_module.SessionLocal.configure(bind=engine)
 
-    from app.db.models import Base
     from app.main import app
     from app.sdk import providers
 
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
+    reset_schema(TEST_DATABASE_URL)
 
     # Remove the simulated token delay so tests stay fast.
     providers.MockProvider.chunk_delay_seconds = 0

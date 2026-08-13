@@ -22,16 +22,23 @@ IP_TOKEN = "[REDACTED_IP]"
 EMAIL_RE = re.compile(r"\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 
 # 13-19 digits, optionally separated by spaces or hyphens, e.g. 4111 1111 1111 1111.
-CARD_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+# The run must END on a digit: `(?:\d[ -]?){13,19}` also consumed the separator
+# after the final digit, so "…1111 ssn" redacted to "[REDACTED_CARD]ssn".
+CARD_RE = re.compile(r"\b(?:\d[ -]?){12,18}\d\b")
 
 SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 
 # International and NANP shapes: +91 98765 43210, (555) 123-4567, 555-123-4567.
 # Groups run to 5 digits because several countries (India, for one) use 5-digit
 # blocks — capping at 4 silently missed them.
+#
+# The leading `\+?` sits OUTSIDE the optional country-code group: when that group
+# does not match (as with "+91 98765 43210", where 91 is consumed as the first
+# block), a bare `+` was left stranded before the token.
 PHONE_RE = re.compile(
     r"(?<![\w.])"
-    r"(?:\+\d{1,3}[ -]?)?"
+    r"\+?"
+    r"(?:\d{1,3}[ -])?"
     r"(?:\(\d{2,5}\)[ -]?|\d{2,5}[ -])"
     r"\d{3,5}[ -]?\d{3,5}"
     r"(?![\w.])"

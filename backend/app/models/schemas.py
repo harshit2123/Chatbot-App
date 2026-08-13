@@ -64,6 +64,8 @@ class InferenceLogIn(BaseModel):
     provider: str = Field(min_length=1, max_length=100)
     model: str = Field(min_length=1, max_length=200)
     latency_ms: int | None = Field(default=None, ge=0)
+    # Streaming only; null for blocking calls.
+    ttft_ms: int | None = Field(default=None, ge=0)
     prompt_tokens: int | None = Field(default=None, ge=0)
     completion_tokens: int | None = Field(default=None, ge=0)
     status: Literal["success", "error", "cancelled"]
@@ -84,6 +86,7 @@ class InferenceLogOut(BaseModel):
     provider: str
     model: str
     latency_ms: int | None
+    ttft_ms: int | None
     prompt_tokens: int | None
     completion_tokens: int | None
     status: str
@@ -100,6 +103,8 @@ class MetricsSummary(BaseModel):
     error_rate: float
     avg_latency_ms: float | None
     p95_latency_ms: float | None
+    # Averaged over streamed calls only; null when there are none in the window.
+    avg_ttft_ms: float | None
     total_prompt_tokens: int
     total_completion_tokens: int
 

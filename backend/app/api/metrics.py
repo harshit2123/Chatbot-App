@@ -63,6 +63,9 @@ def metrics_summary(
             func.percentile_cont(0.95)
             .within_group(InferenceLog.latency_ms.asc())
             .label("p95_latency"),
+            # Streaming calls only — non-streaming rows have NULL ttft_ms and
+            # avg() skips them, so this is not diluted by blocking traffic.
+            func.avg(InferenceLog.ttft_ms).label("avg_ttft"),
             func.sum(case((InferenceLog.status == STATUS_ERROR, 1), else_=0)).label("errors"),
             func.sum(func.coalesce(InferenceLog.prompt_tokens, 0)).label("prompt_tokens"),
             func.sum(func.coalesce(InferenceLog.completion_tokens, 0)).label(
@@ -81,6 +84,7 @@ def metrics_summary(
         error_rate=(errors / total) if total else 0.0,
         avg_latency_ms=float(row.avg_latency) if row.avg_latency is not None else None,
         p95_latency_ms=float(row.p95_latency) if row.p95_latency is not None else None,
+        avg_ttft_ms=float(row.avg_ttft) if row.avg_ttft is not None else None,
         total_prompt_tokens=int(row.prompt_tokens or 0),
         total_completion_tokens=int(row.completion_tokens or 0),
     )

@@ -10,6 +10,9 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app ./app
+# Migrations run at startup, so the revision scripts must ship in the image.
+COPY backend/migrations ./migrations
+COPY backend/alembic.ini ./alembic.ini
 # The API is the task producer, so it needs the task definitions and the
 # redaction module for the synchronous fallback path.
 COPY worker ./worker

@@ -2,34 +2,46 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
 
 from app.api import conversations, ingest, metrics
 from app.config import get_settings
-from app.db.models import Base
-from app.db.session import engine
+from app.sdk.logging import start_replay_worker
 
 logging.basicConfig(level=logging.INFO)
 
 
+def run_migrations() -> None:
+    """Bring the database to the latest revision.
+
+    Alembic rather than `create_all()`: create_all only ever creates missing
+    tables, so it silently ignores every change to an existing one. Adding a
+    column or relaxing a constraint left older databases stale, which had
+    already forced one ad-hoc `ALTER` at startup.
+
+    Running migrations in-process on boot suits a single-service deployment.
+    With multiple replicas this becomes a race, and migrations belong in an
+    init container or a deploy step instead — see k8s/README.md.
+    """
+    config = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+    config.set_main_option("script_location", str(Path(__file__).resolve().parent.parent / "migrations"))
+    config.set_main_option("sqlalchemy.url", get_settings().database_url)
+    command.upgrade(config, "head")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Phase 1 uses create_all for speed. A real deployment wants Alembic
-    # migrations; noted in the README as a known gap.
-    Base.metadata.create_all(bind=engine)
+    run_migrations()
 
-    # create_all() only creates missing tables — it never alters existing ones.
-    # Databases created before conversation_id became nullable still carry the
-    # NOT NULL constraint, which would block deleting a conversation while
-    # keeping its telemetry. Exactly the class of problem Alembic exists to
-    # solve; this is a targeted stopgap, not a migration system.
-    with engine.begin() as conn:
-        conn.execute(
-            text("ALTER TABLE inference_logs ALTER COLUMN conversation_id DROP NOT NULL")
-        )
+    # Replay runs only in the background thread. Draining synchronously here
+    # would deadlock: the spool posts to this app's own /ingest endpoint, which
+    # cannot answer until startup completes.
+    start_replay_worker(get_settings())
 
     yield
 
