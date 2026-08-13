@@ -21,6 +21,7 @@ database is slow, and cannot be something a developer has to remember to add.
   - [The path of a single message](#the-path-of-a-single-message)
   - [Component responsibilities](#component-responsibilities)
   - [Why instrumentation is automatic](#why-instrumentation-is-automatic)
+  - [Durable log delivery](#durable-log-delivery)
   - [Why ingestion is decoupled from storage](#why-ingestion-is-decoupled-from-storage)
   - [Streaming](#streaming)
   - [Cancellation](#cancellation)
@@ -79,6 +80,16 @@ cd frontend && npm install && npm run dev
 
 `INGEST_SYNC=true` bypasses the queue entirely and writes logs inline — useful for
 running the API without a broker.
+
+**Migrations** run automatically on startup (`alembic upgrade head`). To manage them
+by hand:
+
+```bash
+cd backend
+.venv/bin/alembic upgrade head                       # apply
+.venv/bin/alembic revision --autogenerate -m "..."   # create after a model change
+.venv/bin/alembic downgrade -1                       # roll back one
+```
 
 ---
 
@@ -215,6 +226,34 @@ This matters because **manual instrumentation rots**. Any approach where a devel
 must remember to log at each call site eventually has unlogged call sites. Here,
 forgetting is not possible — the only path to the model runs through the wrapper.
 
+### Durable log delivery
+
+The wrapper writes each event to an on-disk spool **before** attempting the POST,
+and removes it only once the endpoint confirms acceptance. Without that ordering,
+an ingestion outage silently discarded telemetry — the exact blind spot this system
+exists to prevent.
+
+```
+build event ──► write spool file (fsync + atomic rename)
+                      │
+                      ▼
+                POST /ingest ──► 2xx ──► delete spool file
+                      │
+                      └──► failure ──► file stays; replay loop retries
+```
+
+Details that matter:
+
+- **Write-then-send, not send-then-write.** A crash between the two is
+  indistinguishable from a failed delivery, and both leave a recoverable file.
+- **4xx is terminal, 5xx is not.** A validation error will never become valid, so
+  retrying it forever would block the spool behind a permanently bad event. `408`
+  and `429` are treated as retryable because they are about timing, not payload.
+- **Bounded.** The spool drops its oldest entries past a ceiling, so a long outage
+  cannot fill the disk. Recent telemetry is more actionable than stale telemetry.
+- **Replay stops at the first failure** rather than hammering a downed endpoint with
+  the entire backlog every cycle.
+
 ### Why ingestion is decoupled from storage
 
 The naive version writes to Postgres inside the `/ingest` request. That couples your
@@ -271,7 +310,8 @@ HTTP request.
 | **Broker down** | `/ingest` degrades to a synchronous write rather than dropping the event, and reports `queued: false` |
 | LLM call fails | Logged `status=error` with the provider's message, surfaced as an SSE `error` frame |
 | Generation cancelled | Logged `status=cancelled` with partial output preserved |
-| Ingestion endpoint unreachable | Warned and dropped — logging must never break chat. The one non-durable hop; see [Known limitations](#known-limitations) |
+| Ingestion endpoint unreachable | The event is already on the durable spool; a background loop replays it once ingestion recovers |
+| Process crash / power loss mid-delivery | The spool entry survives on disk (`fsync` before rename) and is replayed on the next run |
 
 ---
 
@@ -405,6 +445,9 @@ All via environment variables; see [`.env.example`](backend/.env.example).
 | `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
 | `INGEST_URL` | `http://127.0.0.1:8000/ingest` | Where the wrapper posts log events |
 | `INGEST_SYNC` | `false` | Bypass the queue, write logs inline |
+| `SPOOL_ENABLED` | `true` | Durable on-disk spool for log events |
+| `SPOOL_DIR` | `/tmp/llm-log-spool` | Where spooled events are written |
+| `SPOOL_REPLAY_INTERVAL_SECONDS` | `30` | How often the replay loop drains the spool |
 | `HISTORY_TURN_LIMIT` | `20` | Context budget in messages |
 | `PREVIEW_MAX_CHARS` | `500` | Preview truncation length |
 | `CANCEL_FLAG_TTL_SECONDS` | `600` | Cancellation flag lifetime |
@@ -521,7 +564,7 @@ dashboard are all provider-agnostic.
 cd backend && .venv/bin/python -m pytest
 ```
 
-**84 tests, no skips.** Each suite creates its own isolated database on demand, so
+**98 tests, no skips.** Each suite creates its own isolated database on demand, so
 the suite runs from a clean machine with only Postgres up.
 
 Two testing decisions worth noting. Suites get **separate databases** so seeded row
@@ -539,9 +582,10 @@ loudly.
 | `test_providers.py` | 14 | Anthropic vs OpenAI request/response shapes, normalized results, stream parsing, factory resolution |
 | `test_sdk_logging.py` | 8 | Wrapper: success, provider failure, unexpected exception, preview truncation, transport failure, non-2xx delivery, non-blocking delivery |
 | `test_streaming_api.py` | 8 | SSE frame sequence, persistence, resume, cancel, 404s, error frames |
-| `test_streaming.py` | 7 | Stream completion, cancellation with partial output, mid-stream errors, abandoned generators, stream/complete parity |
+| `test_streaming.py` | 9 | Stream completion, cancellation with partial output, mid-stream errors, abandoned generators, stream/complete parity |
 | `test_worker.py` | 7 | Task persistence, redact-before-write, malformed payloads, redelivery idempotency, broker binding |
 | `test_metrics.py` | 7 | Aggregation correctness, fractional error rates, bucket ordering, empty windows |
+| `test_spool.py` | 12 | Write-before-send ordering, replay, terminal vs retryable status codes, corruption, capacity, disk failure |
 
 Beyond unit and integration tests, the full stack was verified through a real browser
 (Playwright) against both the mock and live providers: incremental token rendering,
@@ -676,6 +720,35 @@ email [REDACTED_EMAIL] phone [REDACTED_PHONE] card [REDACTED_CARD] ssn [REDACTED
 - Five services run under Compose: `postgres`, `redis`, `backend`, `worker`,
   `frontend`.
 
+### Durable spool
+
+Verified by breaking ingestion and watching an event survive:
+
+```
+ingest_url pointed at a dead port
+  -> "Failed to deliver inference log ...: [Errno 111] Connection refused"
+  -> pending after failed delivery: 1        (event held on disk)
+
+ingestion restored, replay run
+  -> replayed: 1
+  -> pending after replay: 0
+  -> row present in Postgres, input_preview = "recovered from spool"
+```
+
+The event survived a total delivery failure and reached the database on retry.
+
+### Migrations
+
+Startup now runs `alembic upgrade head` instead of `create_all()`:
+
+```
+INFO  [alembic.runtime.migration] Running upgrade  -> 948613cdc5dc, initial schema
+alembic revision: 948613cdc5dc
+```
+
+The test suite applies the same migrations rather than `create_all()`, so a
+migration that fails to apply fails the suite — not just the deploy.
+
 ### Bugs this audit found
 
 Verification is only worth doing if it can fail. It did, four times:
@@ -715,7 +788,7 @@ failure mode, and only checking the plumbing — not the output — surfaces it.
 
 ```bash
 docker compose up -d --build
-cd backend && .venv/bin/python -m pytest        # 84 tests
+cd backend && .venv/bin/python -m pytest        # 98 tests
 curl -s localhost:8000/metrics/summary?window_minutes=60
 docker compose logs worker | grep succeeded
 ```
@@ -726,9 +799,8 @@ docker compose logs worker | grep succeeded
 
 Deliberate scoping calls, stated plainly rather than hidden.
 
-- **The wrapper → `/ingest` hop is best-effort.** If the endpoint is unreachable the
-  event is warned and dropped. Everything downstream of `/ingest` is durable; this
-  first hop is not. A local disk spool with replay would close it.
+- **No dead-letter queue.** Malformed tasks are logged and dropped rather than
+  parked somewhere reviewable.
 - **A client that disconnects mid-stream is not reliably logged.** When the browser
   vanishes (tab closed, network drop), the ASGI server abandons the response
   generator instead of closing it. Cleanup lives in a `finally`, which only runs
@@ -745,13 +817,8 @@ Deliberate scoping calls, stated plainly rather than hidden.
   spool *before* the provider call, then marking it complete afterward, makes an
   abandoned stream a recoverable record rather than a lost one. That is the same
   local-spool work listed above, and it subsumes this.
-- **No dead-letter queue.** Malformed tasks are logged and dropped.
 - **Celery is a task queue, not a durable replayable event log.**
-- **Schema created via `create_all()`**, not Alembic migrations.
 - **No auth or rate limiting** anywhere, including `/ingest`.
-- **`latency_ms` on streamed calls measures full stream duration.** Time-to-first-token
-  is the more meaningful streaming metric and is not yet captured — a 17-second stream
-  whose first token arrived in 400ms is currently logged as 17 seconds of latency.
 - **The frontend image runs the Vite dev server** so `VITE_API_URL` stays
   runtime-configurable. Production would build the bundle and serve it behind nginx.
 
@@ -761,18 +828,15 @@ Deliberate scoping calls, stated plainly rather than hidden.
 
 In priority order, with reasoning:
 
-1. **Time-to-first-token.** Small change, and it fixes a metric the dashboard
-   currently reports misleadingly for streamed calls.
-2. **Durable local spool for log delivery.** Closes the one remaining place where an
-   event can be lost.
-3. **Alembic migrations.** `create_all()` does not survive the first schema change in
-   production.
-4. **Auth and per-user scoping.** Requires the `users` table, and turns the dashboard
+1. **Auth and per-user scoping.** Requires the `users` table, and turns the dashboard
    into something you could expose to more than one team.
-5. **Kafka or Redis Streams** if replay or event sourcing becomes a requirement. Not
+2. **Dead-letter queue.** Malformed tasks are currently logged and dropped; parking
+   them somewhere reviewable is the difference between "we dropped it" and "we can
+   see what we dropped".
+3. **Kafka or Redis Streams** if replay or event sourcing becomes a requirement. Not
    before — the queue is sufficient at current scale, and swapping it is contained to
    one function.
-6. **Kubernetes — apply the manifests to a real cluster.** [`k8s/`](k8s/) contains a
+4. **Kubernetes — apply the manifests to a real cluster.** [`k8s/`](k8s/) contains a
    complete set (Deployments, StatefulSets with PVCs, probes, initContainers, KEDA
    queue-depth autoscaling) but they have not been run against a live cluster. The
    remaining work is provisioning one, loading images, and fixing whatever the first
