@@ -1,0 +1,46 @@
+/* Design tokens. Direction: a quiet instrument panel — warm near-black ground,
+   one amber accent used semantically (live/active), plus green/red reserved
+   strictly for log status. Nothing decorative competes with the data. */
+
+:root {
+  --color-ground: oklch(17% 0.008 60);
+  --color-surface: oklch(21% 0.009 60);
+  --color-surface-raised: oklch(25% 0.011 60);
+  --color-border: oklch(31% 0.011 60);
+  --color-border-strong: oklch(40% 0.014 60);
+
+  --color-text: oklch(94% 0.006 80);
+  --color-text-muted: oklch(72% 0.011 75);
+  --color-text-faint: oklch(56% 0.012 70);
+
+  --color-accent: oklch(76% 0.15 68);
+  --color-accent-dim: oklch(48% 0.09 68);
+  --color-success: oklch(72% 0.15 155);
+  --color-danger: oklch(66% 0.19 25);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.9375rem;
+  --text-lg: 1.0625rem;
+  --text-title: clamp(1.1rem, 0.95rem + 0.5vw, 1.35rem);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  --duration-fast: 130ms;
+  --duration-normal: 240ms;
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --sidebar-width: 288px;
+}

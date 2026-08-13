@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+
+# Env — never commit real keys
+.env
+.env.local
+
+# OS
+.DS_Store
+*.tsbuildinfo
