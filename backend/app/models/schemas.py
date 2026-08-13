@@ -15,6 +15,12 @@ class ConversationCreate(BaseModel):
     title: str | None = Field(default=None, max_length=200)
 
 
+class ConversationUpdate(BaseModel):
+    """Rename. Title is required here — a rename to nothing is a delete."""
+
+    title: str = Field(min_length=1, max_length=200)
+
+
 class ConversationOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -72,7 +78,8 @@ class InferenceLogOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    conversation_id: uuid.UUID
+    # Null when the parent conversation was deleted but the telemetry was kept.
+    conversation_id: uuid.UUID | None
     message_id: uuid.UUID | None
     provider: str
     model: str

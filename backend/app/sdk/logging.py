@@ -12,6 +12,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import httpx
@@ -43,14 +44,13 @@ def _flatten(messages: list[ChatMessage]) -> str:
     return "\n".join(f"{m.role}: {m.content}" for m in messages)
 
 
-def emit_log_event(event: dict, settings: Settings) -> None:
-    """Ship a log event to the ingestion endpoint.
+# Delivery runs off the request thread. Bounded so a stuck endpoint cannot
+# spawn threads without limit; `daemon` so workers never block shutdown.
+_delivery_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="log-delivery")
 
-    Logging must never break the chat request, so transport failures are
-    swallowed and recorded locally instead of propagating. That is a real
-    tradeoff: an ingestion outage silently drops observability data. A durable
-    local spool would be the fix; see README future work.
-    """
+
+def _deliver(event: dict, settings: Settings) -> None:
+    """Perform the actual POST. Runs on a delivery thread, never the caller's."""
     try:
         response = httpx.post(settings.ingest_url, json=event, timeout=INGEST_TIMEOUT_SECONDS)
     except httpx.HTTPError as exc:
@@ -66,6 +66,30 @@ def emit_log_event(event: dict, settings: Settings) -> None:
             response.status_code,
             response.text[:200],
         )
+
+
+def emit_log_event(event: dict, settings: Settings) -> None:
+    """Ship a log event to the ingestion endpoint, without blocking the caller.
+
+    Delivery is dispatched to a background thread. This is not just an
+    optimization: the wrapper POSTs to an endpoint served by this same process,
+    and doing that synchronously from inside a streaming request deadlocks —
+    the single worker is busy serving the stream and cannot answer itself, so
+    the POST times out and the log is lost. That failure is invisible without
+    checking server logs, which is exactly the blind spot this system exists to
+    prevent.
+
+    Logging must never break chat, so transport failures are swallowed and
+    recorded locally. An ingestion outage still drops observability data; a
+    durable local spool would close that gap. See README future work.
+    """
+    try:
+        _delivery_pool.submit(_deliver, event, settings)
+    except RuntimeError as exc:
+        # Pool shut down (interpreter exiting). Fall back to a direct send so a
+        # log emitted during shutdown is not silently discarded.
+        logger.debug("Delivery pool unavailable, sending inline: %s", exc)
+        _deliver(event, settings)
 
 
 def instrumented_completion(
@@ -182,6 +206,10 @@ def instrumented_stream(
         }
         return {**base, **overrides}
 
+    # Guards against double-emitting when several exit paths could fire, and
+    # lets the `finally` below detect a stream that ended with no log at all.
+    emitted = False
+
     try:
         for chunk in provider.stream(model=model, messages=messages):
             resolved_provider = chunk.provider
@@ -193,19 +221,47 @@ def instrumented_stream(
                 break
 
             if should_cancel is not None and should_cancel():
+                emitted = True
                 emit_log_event(build_event(status=STATUS_CANCELLED), settings)
                 return
 
             collected.append(chunk.delta)
             yield chunk
+
+        # Normal completion. Emitted here, inside the try, so the `finally`
+        # below sees `emitted` already set.
+        emitted = True
+        emit_log_event(build_event(), settings)
     except ProviderError as exc:
+        emitted = True
         emit_log_event(build_event(status="error", error_message=str(exc)), settings)
         raise
+    except GeneratorExit:
+        # The consumer stopped iterating — in practice, the browser disconnected
+        # mid-stream. GeneratorExit derives from BaseException, so it escapes the
+        # handler below; without this branch the call was never logged despite
+        # tokens having been spent. Logged as `cancelled` because that is what
+        # it is: a generation stopped before completion, not a provider error.
+        emitted = True
+        emit_log_event(
+            build_event(status=STATUS_CANCELLED, error_message="client disconnected"),
+            settings,
+        )
+        raise
     except Exception as exc:  # noqa: BLE001 - unexpected failures must still be logged
+        emitted = True
         emit_log_event(
             build_event(status="error", error_message=f"{type(exc).__name__}: {exc}"),
             settings,
         )
         raise
-
-    emit_log_event(build_event(), settings)
+    finally:
+        # Last line of defence. If this generator is finalized without any of
+        # the paths above running — which is what happens when the ASGI server
+        # abandons it on client disconnect — a log is still emitted. An
+        # unlogged model call is the one outcome this system must never have.
+        if not emitted:
+            emit_log_event(
+                build_event(status=STATUS_CANCELLED, error_message="stream abandoned"),
+                settings,
+            )

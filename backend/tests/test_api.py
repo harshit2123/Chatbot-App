@@ -111,6 +111,64 @@ def test_chat_turn_emits_an_inference_log(client, conversation_id):
     assert logs[0]["message_id"] is not None
 
 
+def test_rename_conversation(client, conversation_id):
+    response = client.patch(f"/conversations/{conversation_id}", json={"title": "  Renamed  "})
+
+    assert response.status_code == 200
+    # Whitespace is trimmed so the sidebar never shows padded titles.
+    assert response.json()["title"] == "Renamed"
+
+    listed = client.get("/conversations").json()
+    assert next(c for c in listed if c["id"] == conversation_id)["title"] == "Renamed"
+
+
+def test_rename_rejects_empty_title(client, conversation_id):
+    """A rename to nothing is a delete; it must not silently blank the title."""
+    assert client.patch(f"/conversations/{conversation_id}", json={"title": ""}).status_code == 422
+
+
+def test_rename_survives_a_new_message(client, conversation_id):
+    """Auto-titling must not overwrite a title the user chose."""
+    client.patch(f"/conversations/{conversation_id}", json={"title": "My title"})
+    client.post(f"/conversations/{conversation_id}/messages", json={"content": "hello"})
+
+    listed = client.get("/conversations").json()
+    assert next(c for c in listed if c["id"] == conversation_id)["title"] == "My title"
+
+
+def test_delete_removes_conversation_and_messages(client, conversation_id):
+    client.post(f"/conversations/{conversation_id}/messages", json={"content": "hello"})
+
+    assert client.delete(f"/conversations/{conversation_id}").status_code == 204
+
+    assert client.get(f"/conversations/{conversation_id}/messages").status_code == 404
+    assert all(c["id"] != conversation_id for c in client.get("/conversations").json())
+
+
+def test_delete_keeps_inference_logs(client, conversation_id):
+    """Telemetry outlives the chat: deleting a conversation must not rewrite history.
+
+    Latency, error rate, and spend are operational metrics. Letting a sidebar
+    cleanup silently change them would make the dashboard untrustworthy.
+    """
+    client.post(f"/conversations/{conversation_id}/messages", json={"content": "hello"})
+    before = len(client.get("/logs", params={"limit": 500}).json())
+    assert before > 0
+
+    client.delete(f"/conversations/{conversation_id}")
+
+    after = client.get("/logs", params={"limit": 500}).json()
+    assert len(after) == before
+    # The log survives, detached from the deleted conversation.
+    assert any(log["conversation_id"] is None for log in after)
+
+
+def test_delete_and_rename_404_on_unknown_conversation(client):
+    missing = uuid.uuid4()
+    assert client.delete(f"/conversations/{missing}").status_code == 404
+    assert client.patch(f"/conversations/{missing}", json={"title": "x"}).status_code == 404
+
+
 def test_unknown_conversation_returns_404(client):
     missing = uuid.uuid4()
     assert client.get(f"/conversations/{missing}/messages").status_code == 404

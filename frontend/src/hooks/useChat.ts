@@ -67,6 +67,44 @@ export function useChat() {
     }
   }, []);
 
+  const renameConversation = useCallback(async (conversationId: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+
+    // Optimistic: renaming is cheap to reverse and the sidebar should feel instant.
+    setConversations((prev) =>
+      prev.map((c) => (c.id === conversationId ? { ...c, title: trimmed } : c)),
+    );
+    try {
+      await api.renameConversation(conversationId, trimmed);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to rename conversation');
+      void refreshConversations();
+    }
+  }, [refreshConversations]);
+
+  const deleteConversation = useCallback(
+    async (conversationId: string) => {
+      try {
+        await api.deleteConversation(conversationId);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to delete conversation');
+        return;
+      }
+
+      setConversations((prev) => prev.filter((c) => c.id !== conversationId));
+
+      // Only clear the view if the deleted conversation was the open one.
+      if (conversationId === activeId) {
+        abortRef.current?.abort();
+        setActiveId(null);
+        setMessages([]);
+        setStreamingText('');
+      }
+    },
+    [activeId],
+  );
+
   const cancelGeneration = useCallback(async () => {
     if (!activeId || !isStreaming) return;
     try {
@@ -173,6 +211,8 @@ export function useChat() {
     startNewConversation,
     sendMessage,
     cancelGeneration,
+    renameConversation,
+    deleteConversation,
     dismissError: () => setError(null),
   };
 }

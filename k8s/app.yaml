@@ -1,0 +1,169 @@
+# Stateless application services.
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: llm-logs
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: llm-logs
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      # Wait for Postgres rather than crash-looping until it happens to be up.
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -U postgres -d llmlogs; do sleep 2; done
+      containers:
+        - name: backend
+          image: llm-logs-backend:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: llm-logs
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -U postgres -d llmlogs; do sleep 2; done
+      containers:
+        - name: worker
+          image: llm-logs-worker:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          # No HTTP endpoint to probe. `celery inspect ping` asks the worker
+          # itself whether it is consuming, which is the property that matters.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - celery -A worker.celery_app.celery_app inspect ping -d celery@$HOSTNAME
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+      # acks_late means an in-flight task is redelivered if the pod dies, but
+      # giving it time to finish avoids the redelivery entirely.
+      terminationGracePeriodSeconds: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: llm-logs
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 5173
+      targetPort: 5173
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: llm-logs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: llm-logs-frontend:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # Read by the browser, so it must be an address the browser can
+            # reach — an Ingress hostname in a real cluster, not the in-cluster
+            # service DNS.
+            - name: VITE_API_URL
+              value: http://localhost:8000
+          ports:
+            - containerPort: 5173
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5173
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi

@@ -31,8 +31,10 @@ export interface InferenceLog {
   latency_ms: number | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'cancelled';
   error_message: string | null;
+  input_preview: string | null;
+  output_preview: string | null;
   created_at: string;
 }
 
@@ -193,6 +195,20 @@ export const api = {
     request<InferenceLog[]>(
       conversationId ? `/logs?conversation_id=${conversationId}` : '/logs',
     ),
+
+  renameConversation: (conversationId: string, title: string) =>
+    request<Conversation>(`/conversations/${conversationId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    }),
+
+  deleteConversation: async (conversationId: string): Promise<void> => {
+    // 204 No Content, so there is no body to parse.
+    const response = await fetch(`${API_URL}/conversations/${conversationId}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) throw new Error(`Delete failed (${response.status})`);
+  },
 
   cancelGeneration: (conversationId: string) =>
     request<{ status: string }>(`/conversations/${conversationId}/cancel`, {

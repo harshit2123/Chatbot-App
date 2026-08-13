@@ -8,16 +8,17 @@ from collections.abc import Iterator
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from app.api import cancellation
 from app.config import Settings, get_settings
-from app.db.models import ROLE_ASSISTANT, ROLE_USER, Conversation, Message
+from app.db.models import ROLE_ASSISTANT, ROLE_USER, Conversation, InferenceLog, Message
 from app.db.session import SessionLocal, get_db
 from app.models.schemas import (
     ConversationCreate,
     ConversationOut,
+    ConversationUpdate,
     MessageCreate,
     MessageOut,
     SendMessageResponse,
@@ -76,6 +77,26 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _persist_partial_reply(conversation_id: uuid.UUID, content: str) -> Message | None:
+    """Store whatever was generated before a stream ended early.
+
+    Used when the client disconnects mid-stream: the tokens were produced and
+    paid for, so dropping them would leave the conversation with an orphaned
+    user message and no reply on resume.
+    """
+    if not content:
+        return None
+
+    with SessionLocal() as session:
+        message = Message(
+            conversation_id=conversation_id, role=ROLE_ASSISTANT, content=content
+        )
+        session.add(message)
+        session.commit()
+        session.refresh(message)
+        return message
+
+
 @router.post("", response_model=ConversationOut, status_code=status.HTTP_201_CREATED)
 def create_conversation(
     payload: ConversationCreate, db: Session = Depends(get_db)
@@ -91,6 +112,45 @@ def create_conversation(
 def list_conversations(db: Session = Depends(get_db)) -> list[Conversation]:
     stmt = select(Conversation).order_by(Conversation.created_at.desc())
     return list(db.scalars(stmt).all())
+
+
+@router.patch("/{conversation_id}", response_model=ConversationOut)
+def rename_conversation(
+    conversation_id: uuid.UUID,
+    payload: ConversationUpdate,
+    db: Session = Depends(get_db),
+) -> Conversation:
+    """Rename a conversation. Titles are otherwise derived from the first message."""
+    conversation = _load_conversation(conversation_id, db)
+    conversation.title = payload.title.strip()
+    db.commit()
+    db.refresh(conversation)
+    return conversation
+
+
+@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_conversation(conversation_id: uuid.UUID, db: Session = Depends(get_db)) -> None:
+    """Delete a conversation and its messages.
+
+    Inference logs are deliberately **kept**, with their foreign keys nulled.
+    Deleting a chat is a user action about their own content; the telemetry
+    behind it is operational data whose aggregate value (latency, error rate,
+    spend) should not silently change because someone tidied a sidebar. The
+    logs' previews are already truncated and PII-redacted, so retaining them
+    does not retain the conversation.
+    """
+    _load_conversation(conversation_id, db)
+
+    # Null the log references first: the FK would otherwise block the delete,
+    # and ON DELETE CASCADE here would destroy the telemetry.
+    db.execute(
+        update(InferenceLog)
+        .where(InferenceLog.conversation_id == conversation_id)
+        .values(conversation_id=None, message_id=None)
+    )
+    db.execute(delete(Message).where(Message.conversation_id == conversation_id))
+    db.execute(delete(Conversation).where(Conversation.id == conversation_id))
+    db.commit()
 
 
 @router.get("/{conversation_id}/messages", response_model=list[MessageOut])
@@ -174,6 +234,8 @@ def stream_message(
         # The request-scoped session is closed once this generator starts, so
         # the stream owns its own session for the final write.
         collected: list[str] = []
+        chunks = None
+        finished = False
 
         yield _sse("start", {"user_message": user_message_payload})
 
@@ -192,12 +254,24 @@ def stream_message(
             for chunk in chunks:
                 collected.append(chunk.delta)
                 yield _sse("delta", {"content": chunk.delta})
+            finished = True
         except ProviderError as exc:
+            finished = True
             yield _sse("error", {"detail": str(exc)})
             return
         except Exception as exc:  # noqa: BLE001 - surface, don't hang the client
+            finished = True
             yield _sse("error", {"detail": f"{type(exc).__name__}: {exc}"})
             return
+        finally:
+            # Runs however this generator ends — including when the client
+            # disconnects mid-stream and the generator is finalized without
+            # GeneratorExit ever reaching the loop above. Without this, an
+            # abandoned stream produced no log at all despite tokens having
+            # been spent: exactly the blind spot this system exists to prevent.
+            if not finished and chunks is not None:
+                chunks.close()  # triggers the wrapper's own `cancelled` log
+                _persist_partial_reply(conversation_id, "".join(collected))
 
         was_cancelled = cancellation.is_cancelled(str(conversation_id))
         content = "".join(collected)

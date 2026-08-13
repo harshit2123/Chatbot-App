@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-logs
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: llm-logs
+data:
+  DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/llmlogs
+  REDIS_URL: redis://redis:6379/0
+  LLM_PROVIDER: mock
+  LLM_MODEL: mock/echo-1
+  INGEST_URL: http://127.0.0.1:8000/ingest
+  HISTORY_TURN_LIMIT: "20"
+  PREVIEW_MAX_CHARS: "500"
+  CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: llm-logs
+type: Opaque
+stringData:
+  # Replace before applying, or supply via External Secrets / Sealed Secrets.
+  # Left empty so the stack starts on the mock provider without credentials.
+  OPENROUTER_API_KEY: ""
+  POSTGRES_PASSWORD: postgres

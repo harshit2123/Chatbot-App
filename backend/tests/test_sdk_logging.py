@@ -7,6 +7,8 @@ are what stop that from hiding a real regression.
 
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 
 import pytest
@@ -14,6 +16,19 @@ import pytest
 from app.config import Settings
 from app.sdk.logging import instrumented_completion
 from app.sdk.providers import ChatMessage, CompletionResult, ProviderError
+
+
+def _wait_for_delivery(timeout: float = 5.0) -> None:
+    """Block until queued log deliveries have run."""
+    import app.sdk.logging as sdk_logging
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if sdk_logging._delivery_pool._work_queue.empty():
+            # Queue drained; give in-flight workers a moment to finish.
+            time.sleep(0.05)
+            return
+        time.sleep(0.01)
 
 
 @pytest.fixture
@@ -182,6 +197,43 @@ def test_transport_failure_does_not_break_the_call(settings, monkeypatch):
     assert result.content == "still works"
 
 
+def test_delivery_does_not_block_the_caller(settings, monkeypatch):
+    """Regression: synchronous delivery deadlocked streaming requests.
+
+    The wrapper POSTs to an endpoint served by the same process. Doing that
+    inline from inside a streaming request meant the single worker was busy
+    serving the stream and could not answer its own request — the POST timed
+    out and the log was lost, with no visible error.
+    """
+    import httpx
+
+    release = threading.Event()
+
+    def slow_post(*args, **kwargs):
+        # Simulates an endpoint that cannot respond while the caller is blocked.
+        release.wait(timeout=5)
+        raise httpx.ConnectError("would have deadlocked")
+
+    monkeypatch.setattr(httpx, "post", slow_post)
+
+    provider = StubProvider(result=CompletionResult(content="ok", provider="s", model="m"))
+
+    start = time.perf_counter()
+    result = instrumented_completion(
+        provider=provider,
+        model="m",
+        messages=[ChatMessage(role="user", content="hello")],
+        settings=settings,
+        conversation_id=str(uuid.uuid4()),
+    )
+    elapsed = time.perf_counter() - start
+    release.set()
+
+    assert result.content == "ok"
+    # The caller must return immediately rather than waiting on delivery.
+    assert elapsed < 1.0, f"emit blocked the caller for {elapsed:.2f}s"
+
+
 def test_non_2xx_ingest_response_is_warned_not_silently_dropped(settings, monkeypatch, caplog):
     """A misrouted endpoint returning 400 must not look like a successful delivery."""
     import httpx
@@ -202,5 +254,8 @@ def test_non_2xx_ingest_response_is_warned_not_silently_dropped(settings, monkey
             settings=settings,
             conversation_id=str(uuid.uuid4()),
         )
+        # Delivery is dispatched to a background thread so it never blocks the
+        # chat request; wait for it before asserting on its side effects.
+        _wait_for_delivery()
 
     assert any("rejected log" in record.message for record in caplog.records)

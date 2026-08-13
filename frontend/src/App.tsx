@@ -23,6 +23,8 @@ export default function App() {
     startNewConversation,
     sendMessage,
     cancelGeneration,
+    renameConversation,
+    deleteConversation,
     dismissError,
   } = useChat();
 
@@ -51,6 +53,8 @@ export default function App() {
           setView('chat');
           void startNewConversation();
         }}
+        onRename={renameConversation}
+        onDelete={deleteConversation}
         view={view}
         onShowDashboard={() => setView('dashboard')}
       />

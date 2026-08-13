@@ -62,8 +62,11 @@ class InferenceLog(Base):
     message_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("messages.id"), nullable=True
     )
-    conversation_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=False, index=True
+    # Nullable so a deleted conversation orphans its logs rather than destroying
+    # them: chat content is the user's, but latency/error/spend history is
+    # operational data that should survive a sidebar cleanup.
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=True, index=True
     )
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str] = mapped_column(Text, nullable=False)

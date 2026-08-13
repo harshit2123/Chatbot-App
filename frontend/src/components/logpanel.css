@@ -1,5 +1,5 @@
 .logpanel {
-  width: 268px;
+  width: 320px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -83,18 +83,53 @@
 }
 
 .logrow {
-  padding: var(--space-3);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   background: var(--color-ground);
+  overflow: hidden;
+  transition: border-color var(--duration-fast) var(--ease-out-expo);
+}
+
+.logrow:hover {
+  border-color: var(--color-border-strong);
+}
+
+.logrow--expanded {
+  border-color: var(--color-accent-dim);
+}
+
+/* The whole summary is the toggle target, so the hit area matches the card. */
+.logrow__summary {
+  width: 100%;
   display: grid;
   gap: var(--space-2);
+  padding: var(--space-3);
+  border: none;
+  background: transparent;
+  text-align: left;
 }
 
 .logrow__top {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.logrow__meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.logrow__chevron {
+  font-size: 8px;
+  color: var(--color-text-faint);
+  line-height: 1;
+}
+
+.logrow--expanded .logrow__chevron {
+  color: var(--color-accent);
 }
 
 .badge {
@@ -161,8 +196,86 @@
 
 .logrow__error {
   margin: 0;
+  padding: 0 var(--space-3) var(--space-3);
   font-size: var(--text-xs);
   line-height: 1.5;
   color: var(--color-danger);
   overflow-wrap: anywhere;
+}
+
+/* Expanded detail view */
+.logrow__details {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-surface);
+  animation: details-in var(--duration-normal) var(--ease-out-expo) both;
+}
+
+@keyframes details-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.field {
+  display: grid;
+  gap: 2px;
+}
+
+.field__label {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-faint);
+}
+
+.field__value {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.field__value--mono {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--color-text-muted);
+}
+
+.preview {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.preview__text {
+  margin: 0;
+  padding: var(--space-2);
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-ground);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.55;
+  color: var(--color-text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.preview__empty {
+  font-size: var(--text-xs);
+  color: var(--color-text-faint);
+}
+
+.logrow__note {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--color-text-faint);
+  font-style: italic;
 }

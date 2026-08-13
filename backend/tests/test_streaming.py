@@ -131,6 +131,63 @@ def test_resolved_provider_from_chunks_is_logged(settings, captured):
     assert captured[0]["model"] == "claude-3.5-sonnet"
 
 
+def test_client_disconnect_midstream_is_logged(settings, captured):
+    """Regression: an abandoned stream produced no log at all.
+
+    GeneratorExit derives from BaseException, so it bypassed both `except`
+    clauses and the generator unwound silently — a real provider call, real
+    tokens spent, and zero record of it. Exactly the blind spot this system
+    exists to prevent.
+    """
+    stream = instrumented_stream(
+        provider=StreamStub(["one", "two", "three", "four"]),
+        model="m",
+        messages=[ChatMessage(role="user", content="hello")],
+        settings=settings,
+        conversation_id=str(uuid.uuid4()),
+    )
+
+    # Consume two chunks, then abandon the generator the way a disconnecting
+    # client does.
+    next(stream)
+    next(stream)
+    stream.close()
+
+    assert len(captured) == 1, "abandoned stream must still emit exactly one log"
+    event = captured[0]
+    assert event["status"] == "cancelled"
+    assert event["error_message"] == "client disconnected"
+    # Partial output is retained: those tokens were generated and paid for.
+    assert event["output_preview"] == "onetwo"
+    assert event["latency_ms"] >= 0
+
+
+def test_abandoned_generator_still_emits_exactly_one_log(settings, captured):
+    """A stream dropped without close() must still produce a log, and only one.
+
+    The ASGI server abandons the body iterator on client disconnect rather than
+    closing it, so the `finally` is the only cleanup that reliably runs.
+    """
+    stream = instrumented_stream(
+        provider=StreamStub(["a", "b", "c"]),
+        model="m",
+        messages=[ChatMessage(role="user", content="hello")],
+        settings=settings,
+        conversation_id=str(uuid.uuid4()),
+    )
+    next(stream)
+
+    # Drop the only reference and force finalization.
+    del stream
+    import gc
+
+    gc.collect()
+
+    assert len(captured) == 1
+    assert captured[0]["status"] == "cancelled"
+    assert captured[0]["error_message"] in {"client disconnected", "stream abandoned"}
+
+
 def test_mock_provider_stream_matches_complete_output(settings):
     """Streaming and non-streaming must not diverge in content."""
     provider = MockProvider()

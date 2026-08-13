@@ -91,9 +91,26 @@ running the API without a broker.
 | 3 | Ingestion: receive → validate → extract → store | `/ingest` receives and validates, then enqueues. The worker extracts, redacts, and stores — the four verbs are genuinely separate stages |
 | 4 | Store messages, logs, extracted metadata | `conversations`, `messages`, `inference_logs`, with metadata in typed columns |
 
-**Bonus items:** multi-provider (verified live), streaming, dashboards, Docker Compose,
-event-based async processing, PII redaction. Self-hosted k8s was deliberately scoped
-out — see [What I would do next](#what-i-would-do-next).
+### Bonus items
+
+| Bonus | Status | Evidence |
+|---|---|---|
+| Multi-provider support | **Done** | Two adapters behind one interface; logs show real calls to both `mock` and `Nvidia` (via OpenRouter). Switching is a one-line `LLM_MODEL` change |
+| Streaming responses | **Done** | SSE, token-by-token; verified incremental in a real browser |
+| Latency / throughput / error dashboards | **Done** | 5 aggregation endpoints + 3 charts + provider breakdown, aggregated in SQL |
+| Docker Compose one-command setup | **Done** | `docker compose up --build` brings up all 5 services from a wiped volume |
+| Event-based architecture | **Done** | `/ingest` enqueues to Redis and returns `queued: true`; Celery worker consumes |
+| PII redaction | **Done** | Applied in the worker before persistence; Luhn-validated cards, over-redaction guarded by tests |
+| Deploy on self-hosted k8s | **Manifests written, not applied** | [`k8s/`](k8s/) — 15 resources, YAML-validated. No cluster was provisioned; treat as a design artifact. See [k8s/README.md](k8s/README.md) |
+
+### Frontend requirements
+
+| Requirement | Status | Notes |
+|---|---|---|
+| Cancel a conversation | **Done** | Stop button; two-sided (AbortController + Redis flag). Produces a `cancelled` log with partial output |
+| List conversations | **Done** | Sidebar, newest first |
+| Resume a conversation | **Done** | Full history rehydrated, survives reload |
+| Rename / delete (added) | **Done** | Inline rename, two-step delete confirmation |
 
 ---
 
@@ -314,6 +331,14 @@ oversight.
 **No `users` table.** The spec requires no auth. It is the first thing to add for a
 real deployment, and it is why there is no per-user filtering on the dashboard.
 
+**Deleting a conversation keeps its inference logs.** `inference_logs.conversation_id`
+is nullable, and deletion nulls it rather than cascading. Chat content belongs to the
+user and should disappear when they delete it; latency, error rate, and token spend
+are operational metrics, and letting a sidebar cleanup silently rewrite them would
+make the dashboard untrustworthy. The retained previews are already truncated and
+PII-redacted, so keeping them does not keep the conversation. Cascade-deleting would
+have been the easier default and the wrong one.
+
 ---
 
 ## PII redaction
@@ -349,6 +374,8 @@ Presidio is the upgrade path.
 |---|---|---|
 | POST | `/conversations` | Create |
 | GET | `/conversations` | List (sidebar) |
+| PATCH | `/conversations/{id}` | Rename |
+| DELETE | `/conversations/{id}` | Delete (keeps inference logs — see below) |
 | GET | `/conversations/{id}/messages` | Resume — full history |
 | POST | `/conversations/{id}/messages` | Send, blocking response |
 | POST | `/conversations/{id}/messages/stream` | Send, **SSE streaming** response |
@@ -468,6 +495,22 @@ Deliberate scoping calls, stated plainly rather than hidden.
 - **The wrapper → `/ingest` hop is best-effort.** If the endpoint is unreachable the
   event is warned and dropped. Everything downstream of `/ingest` is durable; this
   first hop is not. A local disk spool with replay would close it.
+- **A client that disconnects mid-stream is not reliably logged.** When the browser
+  vanishes (tab closed, network drop), the ASGI server abandons the response
+  generator instead of closing it. Cleanup lives in a `finally`, which only runs
+  when Python finalizes the generator — and a reference cycle can delay that
+  indefinitely, so the log is sometimes written and sometimes not. Confirmed by
+  observing `/ingest` fire on some abandoned streams and not others.
+
+  Cancel via the **Stop button works reliably** — that path sets a Redis flag the
+  stream loop checks, and never depends on finalization. The gap is specifically
+  the ungraceful disconnect.
+
+  The real fix is not more cleanup handlers: it is to stop treating in-process
+  cleanup as the delivery guarantee. Writing the log event to a durable local
+  spool *before* the provider call, then marking it complete afterward, makes an
+  abandoned stream a recoverable record rather than a lost one. That is the same
+  local-spool work listed above, and it subsumes this.
 - **No dead-letter queue.** Malformed tasks are logged and dropped.
 - **Celery is a task queue, not a durable replayable event log.**
 - **Schema created via `create_all()`**, not Alembic migrations.
@@ -495,11 +538,12 @@ In priority order, with reasoning:
 5. **Kafka or Redis Streams** if replay or event sourcing becomes a requirement. Not
    before — the queue is sufficient at current scale, and swapping it is contained to
    one function.
-6. **Kubernetes.** Deliberately skipped: the lowest-signal item for demonstrating the
-   engineering this project is about. The approach would be a Deployment per service,
-   an HPA on worker pods keyed on **queue depth** rather than CPU, secrets from a
-   secret manager rather than env vars, and Postgres/Redis as managed services rather
-   than pods.
+6. **Kubernetes — apply the manifests to a real cluster.** [`k8s/`](k8s/) contains a
+   complete set (Deployments, StatefulSets with PVCs, probes, initContainers, KEDA
+   queue-depth autoscaling) but they have not been run against a live cluster. The
+   remaining work is provisioning one, loading images, and fixing whatever the first
+   `kubectl apply` reveals — plus NetworkPolicies, managed Postgres/Redis, and real
+   secret management before it is production-shaped.
 
 ### Scaling notes
 
