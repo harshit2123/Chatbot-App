@@ -11,12 +11,21 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 
 import httpx
 
 from app.config import Settings
-from app.sdk.providers import ChatMessage, CompletionResult, Provider, ProviderError
+from app.sdk.providers import (
+    ChatMessage,
+    CompletionResult,
+    Provider,
+    ProviderError,
+    StreamChunk,
+)
+
+STATUS_CANCELLED = "cancelled"
 
 logger = logging.getLogger(__name__)
 
@@ -122,3 +131,81 @@ def instrumented_completion(
         settings,
     )
     return result
+
+
+def instrumented_stream(
+    provider: Provider,
+    model: str,
+    messages: list[ChatMessage],
+    settings: Settings,
+    conversation_id: str,
+    message_id: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Iterator[StreamChunk]:
+    """Stream a completion, emitting one log event when the stream terminates.
+
+    Terminates for three reasons, all of which must be logged:
+      - the stream finishes normally    -> status=success
+      - the provider errors mid-stream  -> status=error
+      - the caller cancels              -> status=cancelled, with partial output
+
+    `latency_ms` measures the full stream duration. Time-to-first-token would be
+    the more useful streaming metric; noted in the README as a future addition.
+    """
+    log_id = str(uuid.uuid4())
+    input_preview = _preview(_flatten(messages), settings.preview_max_chars)
+    started_at = datetime.now(timezone.utc)
+    start = time.perf_counter()
+
+    collected: list[str] = []
+    resolved_provider = provider.name
+    resolved_model = model
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+    def build_event(**overrides) -> dict:
+        base = {
+            "id": log_id,
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "provider": resolved_provider,
+            "model": resolved_model,
+            "latency_ms": int((time.perf_counter() - start) * 1000),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "status": "success",
+            "error_message": None,
+            "input_preview": input_preview,
+            "output_preview": _preview("".join(collected), settings.preview_max_chars),
+            "started_at": started_at.isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return {**base, **overrides}
+
+    try:
+        for chunk in provider.stream(model=model, messages=messages):
+            resolved_provider = chunk.provider
+            resolved_model = chunk.model
+
+            if chunk.is_final:
+                prompt_tokens = chunk.prompt_tokens
+                completion_tokens = chunk.completion_tokens
+                break
+
+            if should_cancel is not None and should_cancel():
+                emit_log_event(build_event(status=STATUS_CANCELLED), settings)
+                return
+
+            collected.append(chunk.delta)
+            yield chunk
+    except ProviderError as exc:
+        emit_log_event(build_event(status="error", error_message=str(exc)), settings)
+        raise
+    except Exception as exc:  # noqa: BLE001 - unexpected failures must still be logged
+        emit_log_event(
+            build_event(status="error", error_message=f"{type(exc).__name__}: {exc}"),
+            settings,
+        )
+        raise
+
+    emit_log_event(build_event(), settings)

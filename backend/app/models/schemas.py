@@ -60,7 +60,7 @@ class InferenceLogIn(BaseModel):
     latency_ms: int | None = Field(default=None, ge=0)
     prompt_tokens: int | None = Field(default=None, ge=0)
     completion_tokens: int | None = Field(default=None, ge=0)
-    status: Literal["success", "error"]
+    status: Literal["success", "error", "cancelled"]
     error_message: str | None = None
     input_preview: str | None = None
     output_preview: str | None = None
@@ -86,6 +86,48 @@ class InferenceLogOut(BaseModel):
     created_at: datetime
 
 
+class MetricsSummary(BaseModel):
+    window_minutes: int
+    total_calls: int
+    error_count: int
+    error_rate: float
+    avg_latency_ms: float | None
+    p95_latency_ms: float | None
+    total_prompt_tokens: int
+    total_completion_tokens: int
+
+
+class LatencyPoint(BaseModel):
+    bucket: datetime
+    avg_latency_ms: float
+    max_latency_ms: int
+    count: int
+
+
+class ErrorPoint(BaseModel):
+    bucket: datetime
+    total: int
+    errors: int
+    error_rate: float
+
+
+class ThroughputPoint(BaseModel):
+    bucket: datetime
+    count: int
+    calls_per_minute: float
+
+
+class ProviderBreakdown(BaseModel):
+    provider: str
+    model: str
+    count: int
+    avg_latency_ms: float | None
+    error_count: int
+
+
 class IngestAccepted(BaseModel):
     id: uuid.UUID
     accepted: bool = True
+    # False when the event was written inline — either because sync mode is on
+    # or because the broker was unreachable and we degraded rather than dropped.
+    queued: bool = True

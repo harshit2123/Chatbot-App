@@ -39,6 +39,9 @@ def client():
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
     os.environ["LLM_PROVIDER"] = "mock"
     os.environ["LLM_MODEL"] = "mock/echo-1"
+    # Write logs inline so assertions about persisted rows don't depend on a
+    # running broker and worker. The queue path is covered in test_worker.py.
+    os.environ["INGEST_SYNC"] = "true"
 
     # Imported after env is set so settings/engine pick up the test database.
     from app.config import get_settings

@@ -1,20 +1,24 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { api, type Conversation, type Message } from '../lib/api';
+import { api, streamMessage, type Conversation, type Message } from '../lib/api';
 
 /**
- * Owns conversation list, active conversation, and turn sending.
+ * Owns conversation list, active conversation, and streaming turns.
  *
- * The user message is rendered optimistically, then reconciled against the
- * server's persisted rows so ids and timestamps are authoritative.
+ * Cancellation is two-sided: AbortController closes the client's connection,
+ * and POST /cancel sets a server flag so the generation actually stops instead
+ * of continuing to burn tokens after the browser walked away.
  */
 export function useChat() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [isSending, setIsSending] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+  const [isStreaming, setIsStreaming] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const abortRef = useRef<AbortController | null>(null);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -28,10 +32,15 @@ export function useChat() {
     void refreshConversations();
   }, [refreshConversations]);
 
+  // Abort any in-flight stream when the component unmounts.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
   /** Resume: hydrate full history for a stored conversation. */
   const selectConversation = useCallback(async (conversationId: string) => {
+    abortRef.current?.abort();
     setActiveId(conversationId);
     setError(null);
+    setStreamingText('');
     setIsLoadingHistory(true);
     try {
       setMessages(await api.getMessages(conversationId));
@@ -50,6 +59,7 @@ export function useChat() {
       setConversations((prev) => [conversation, ...prev]);
       setActiveId(conversation.id);
       setMessages([]);
+      setStreamingText('');
       return conversation.id;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');
@@ -57,12 +67,23 @@ export function useChat() {
     }
   }, []);
 
+  const cancelGeneration = useCallback(async () => {
+    if (!activeId || !isStreaming) return;
+    try {
+      // Tell the server first: aborting locally alone would leave the
+      // generation running server-side.
+      await api.cancelGeneration(activeId);
+    } catch {
+      // Even if the signal fails, still drop the client connection.
+    }
+    abortRef.current?.abort();
+  }, [activeId, isStreaming]);
+
   const sendMessage = useCallback(
     async (content: string) => {
       const trimmed = content.trim();
-      if (!trimmed || isSending) return;
+      if (!trimmed || isStreaming) return;
 
-      // Create a conversation lazily so the user can type first.
       let conversationId = activeId;
       if (!conversationId) {
         conversationId = await startNewConversation();
@@ -70,7 +91,11 @@ export function useChat() {
       }
 
       setError(null);
-      setIsSending(true);
+      setIsStreaming(true);
+      setStreamingText('');
+
+      const controller = new AbortController();
+      abortRef.current = controller;
 
       const optimistic: Message = {
         id: `pending-${crypto.randomUUID()}`,
@@ -81,41 +106,73 @@ export function useChat() {
       };
       setMessages((prev) => [...prev, optimistic]);
 
+      let accumulated = '';
+
       try {
-        const result = await api.sendMessage(conversationId, trimmed);
-        setMessages((prev) => [
-          ...prev.filter((m) => m.id !== optimistic.id),
-          result.user_message,
-          result.assistant_message,
-        ]);
-        // Title is derived server-side from the first message.
+        for await (const event of streamMessage(conversationId, trimmed, controller.signal)) {
+          switch (event.type) {
+            case 'start':
+              // Swap the optimistic row for the server's persisted one.
+              setMessages((prev) =>
+                prev.map((m) => (m.id === optimistic.id ? event.userMessage : m)),
+              );
+              break;
+            case 'delta':
+              accumulated += event.content;
+              setStreamingText(accumulated);
+              break;
+            case 'done':
+            case 'cancelled':
+              if (event.assistantMessage) {
+                setMessages((prev) => [...prev, event.assistantMessage!]);
+              }
+              setStreamingText('');
+              break;
+            case 'error':
+              setError(event.detail);
+              setStreamingText('');
+              break;
+          }
+        }
         void refreshConversations();
       } catch (err) {
-        // Drop the optimistic message: the server may have persisted it, so
-        // reload rather than guess at local state.
-        setError(err instanceof Error ? err.message : 'Failed to send message');
-        try {
-          setMessages(await api.getMessages(conversationId));
-        } catch {
-          setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
+        if (controller.signal.aborted) {
+          // User-initiated cancel. Reload so the partial reply the server
+          // persisted is reflected accurately.
+          try {
+            setMessages(await api.getMessages(conversationId));
+          } catch {
+            /* keep what is on screen */
+          }
+        } else {
+          setError(err instanceof Error ? err.message : 'Failed to send message');
+          try {
+            setMessages(await api.getMessages(conversationId));
+          } catch {
+            setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
+          }
         }
       } finally {
-        setIsSending(false);
+        setIsStreaming(false);
+        setStreamingText('');
+        abortRef.current = null;
       }
     },
-    [activeId, isSending, refreshConversations, startNewConversation],
+    [activeId, isStreaming, refreshConversations, startNewConversation],
   );
 
   return {
     conversations,
     activeId,
     messages,
-    isSending,
+    streamingText,
+    isStreaming,
     isLoadingHistory,
     error,
     selectConversation,
     startNewConversation,
     sendMessage,
+    cancelGeneration,
     dismissError: () => setError(null),
   };
 }

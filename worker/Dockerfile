@@ -6,14 +6,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app
 
+# The worker reuses the backend's models and schemas so the DB write and the
+# validation contract cannot drift between producer and consumer.
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app ./app
-# The API is the task producer, so it needs the task definitions and the
-# redaction module for the synchronous fallback path.
 COPY worker ./worker
 
-EXPOSE 8000
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["celery", "-A", "worker.celery_app.celery_app", "worker", "--loglevel=info", "--concurrency=2"]

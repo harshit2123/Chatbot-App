@@ -58,6 +58,122 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export interface MetricsSummary {
+  window_minutes: number;
+  total_calls: number;
+  error_count: number;
+  error_rate: number;
+  avg_latency_ms: number | null;
+  p95_latency_ms: number | null;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+}
+
+export interface LatencyPoint {
+  bucket: string;
+  avg_latency_ms: number;
+  max_latency_ms: number;
+  count: number;
+}
+
+export interface ErrorPoint {
+  bucket: string;
+  total: number;
+  errors: number;
+  error_rate: number;
+}
+
+export interface ThroughputPoint {
+  bucket: string;
+  count: number;
+  calls_per_minute: number;
+}
+
+export interface ProviderBreakdown {
+  provider: string;
+  model: string;
+  count: number;
+  avg_latency_ms: number | null;
+  error_count: number;
+}
+
+/** Events emitted by the SSE chat stream. */
+export type StreamEvent =
+  | { type: 'start'; userMessage: Message }
+  | { type: 'delta'; content: string }
+  | { type: 'done'; assistantMessage: Message | null }
+  | { type: 'cancelled'; assistantMessage: Message | null }
+  | { type: 'error'; detail: string };
+
+/**
+ * POST a message and yield SSE frames as they arrive.
+ *
+ * Uses fetch + ReadableStream rather than EventSource because EventSource
+ * cannot issue a POST with a JSON body.
+ */
+export async function* streamMessage(
+  conversationId: string,
+  content: string,
+  signal: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  const response = await fetch(`${API_URL}/conversations/${conversationId}/messages/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+    signal,
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Stream failed (${response.status})`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Frames are separated by a blank line; a partial frame stays buffered.
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop() ?? '';
+
+    for (const frame of frames) {
+      if (!frame.trim()) continue;
+
+      let eventName = '';
+      let dataLine = '';
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event: ')) eventName = line.slice(7);
+        else if (line.startsWith('data: ')) dataLine = line.slice(6);
+      }
+      if (!eventName || !dataLine) continue;
+
+      const data = JSON.parse(dataLine);
+      switch (eventName) {
+        case 'start':
+          yield { type: 'start', userMessage: data.user_message };
+          break;
+        case 'delta':
+          yield { type: 'delta', content: data.content };
+          break;
+        case 'done':
+          yield { type: 'done', assistantMessage: data.assistant_message };
+          break;
+        case 'cancelled':
+          yield { type: 'cancelled', assistantMessage: data.assistant_message };
+          break;
+        case 'error':
+          yield { type: 'error', detail: data.detail };
+          break;
+      }
+    }
+  }
+}
+
 export const api = {
   listConversations: () => request<Conversation[]>('/conversations'),
 
@@ -77,4 +193,24 @@ export const api = {
     request<InferenceLog[]>(
       conversationId ? `/logs?conversation_id=${conversationId}` : '/logs',
     ),
+
+  cancelGeneration: (conversationId: string) =>
+    request<{ status: string }>(`/conversations/${conversationId}/cancel`, {
+      method: 'POST',
+    }),
+
+  metricsSummary: (windowMinutes: number) =>
+    request<MetricsSummary>(`/metrics/summary?window_minutes=${windowMinutes}`),
+
+  metricsLatency: (windowMinutes: number) =>
+    request<LatencyPoint[]>(`/metrics/latency?window_minutes=${windowMinutes}`),
+
+  metricsErrors: (windowMinutes: number) =>
+    request<ErrorPoint[]>(`/metrics/errors?window_minutes=${windowMinutes}`),
+
+  metricsThroughput: (windowMinutes: number) =>
+    request<ThroughputPoint[]>(`/metrics/throughput?window_minutes=${windowMinutes}`),
+
+  metricsProviders: (windowMinutes: number) =>
+    request<ProviderBreakdown[]>(`/metrics/providers?window_minutes=${windowMinutes}`),
 };

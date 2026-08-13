@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import conversations, ingest
+from app.api import conversations, ingest, metrics
 from app.config import get_settings
 from app.db.models import Base
 from app.db.session import engine
@@ -34,6 +34,7 @@ app.add_middleware(
 
 app.include_router(conversations.router)
 app.include_router(ingest.router)
+app.include_router(metrics.router)
 
 
 @app.get("/health", tags=["meta"])

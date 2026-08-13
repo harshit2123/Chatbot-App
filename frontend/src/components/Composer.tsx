@@ -4,12 +4,13 @@ import './composer.css';
 
 interface Props {
   onSend: (content: string) => void;
+  onCancel: () => void;
   disabled: boolean;
 }
 
 const MAX_TEXTAREA_HEIGHT_PX = 200;
 
-export function Composer({ onSend, disabled }: Props) {
+export function Composer({ onSend, onCancel, disabled }: Props) {
   const [value, setValue] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -60,9 +61,20 @@ export function Composer({ onSend, disabled }: Props) {
           }}
           onKeyDown={handleKeyDown}
         />
-        <button className="composer__send" type="submit" disabled={disabled || !value.trim()}>
-          {disabled ? 'Sending…' : 'Send'}
-        </button>
+        {disabled ? (
+          <button
+            className="composer__cancel"
+            type="button"
+            onClick={onCancel}
+            data-testid="cancel-button"
+          >
+            Stop
+          </button>
+        ) : (
+          <button className="composer__send" type="submit" disabled={!value.trim()}>
+            Send
+          </button>
+        )}
       </div>
       <p className="composer__hint">Enter to send · Shift + Enter for a new line</p>
     </form>

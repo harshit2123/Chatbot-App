@@ -5,16 +5,22 @@ import './messages.css';
 
 interface Props {
   messages: Message[];
-  isSending: boolean;
+  streamingText: string;
+  isStreaming: boolean;
   isLoadingHistory: boolean;
 }
 
-export function MessageList({ messages, isSending, isLoadingHistory }: Props) {
+export function MessageList({
+  messages,
+  streamingText,
+  isStreaming,
+  isLoadingHistory,
+}: Props) {
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages.length, isSending]);
+  }, [messages.length, isStreaming, streamingText]);
 
   if (isLoadingHistory) {
     return (
@@ -49,14 +55,21 @@ export function MessageList({ messages, isSending, isLoadingHistory }: Props) {
             <div className="bubble__body">{message.content}</div>
           </li>
         ))}
-        {isSending && (
+        {isStreaming && (
           <li className="bubble bubble--assistant">
             <span className="bubble__role">Assistant</span>
-            <div className="bubble__body bubble__body--pending" aria-live="polite">
-              <span className="dot" />
-              <span className="dot" />
-              <span className="dot" />
-            </div>
+            {streamingText ? (
+              <div className="bubble__body" aria-live="polite">
+                {streamingText}
+                <span className="cursor" aria-hidden="true" />
+              </div>
+            ) : (
+              <div className="bubble__body bubble__body--pending" aria-live="polite">
+                <span className="dot" />
+                <span className="dot" />
+                <span className="dot" />
+              </div>
+            )}
           </li>
         )}
       </ol>

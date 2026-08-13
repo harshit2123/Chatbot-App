@@ -27,9 +27,21 @@ class Settings(BaseSettings):
     # receive these log events instead of this app.
     ingest_url: str = "http://127.0.0.1:8000/ingest"
 
+    # Broker/result backend for the log-processing queue, and the store for
+    # per-request cancellation flags.
+    redis_url: str = "redis://localhost:6379/0"
+
+    # Bypass the queue and write logs inline. Useful for running the API
+    # standalone and for tests that assert on persisted rows.
+    ingest_sync: bool = False
+
     # Conversational context budget: how many past messages get replayed to the
     # model on each turn.
     history_turn_limit: int = 20
+
+    # How long a cancellation flag lives. Longer than any plausible generation,
+    # short enough that stale keys expire on their own.
+    cancel_flag_ttl_seconds: int = 600
 
     preview_max_chars: int = 500
     # Both spellings of the dev origin: localhost and 127.0.0.1 are distinct

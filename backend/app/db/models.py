@@ -15,6 +15,7 @@ ROLE_ASSISTANT = "assistant"
 
 STATUS_SUCCESS = "success"
 STATUS_ERROR = "error"
+STATUS_CANCELLED = "cancelled"
 
 
 class Base(DeclarativeBase):

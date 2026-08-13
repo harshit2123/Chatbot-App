@@ -6,13 +6,22 @@ interface Props {
   activeId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
+  view: 'chat' | 'dashboard';
+  onShowDashboard: () => void;
 }
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-export function ConversationSidebar({ conversations, activeId, onSelect, onNew }: Props) {
+export function ConversationSidebar({
+  conversations,
+  activeId,
+  onSelect,
+  onNew,
+  view,
+  onShowDashboard,
+}: Props) {
   return (
     <aside className="sidebar">
       <div className="sidebar__head">
@@ -22,6 +31,13 @@ export function ConversationSidebar({ conversations, activeId, onSelect, onNew }
         </div>
         <button className="sidebar__new" onClick={onNew}>
           New chat
+        </button>
+        <button
+          className={`sidebar__nav${view === 'dashboard' ? ' sidebar__nav--active' : ''}`}
+          onClick={onShowDashboard}
+          aria-current={view === 'dashboard' ? 'page' : undefined}
+        >
+          Observability
         </button>
       </div>
 

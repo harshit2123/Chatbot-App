@@ -7,7 +7,9 @@ the API layer, or the frontend changes — which is what makes the wrapper in
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -41,10 +43,28 @@ class ProviderError(RuntimeError):
     """Raised when a provider call fails. Carries a message safe to log."""
 
 
+@dataclass(frozen=True)
+class StreamChunk:
+    """One token/delta from a streaming response.
+
+    The final chunk carries `usage`, since token counts are only known once the
+    upstream stream completes.
+    """
+
+    delta: str
+    provider: str
+    model: str
+    is_final: bool = False
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+
 class Provider(Protocol):
     name: str
 
     def complete(self, model: str, messages: list[ChatMessage]) -> CompletionResult: ...
+
+    def stream(self, model: str, messages: list[ChatMessage]) -> Iterator[StreamChunk]: ...
 
 
 class MockProvider:
@@ -56,18 +76,25 @@ class MockProvider:
 
     name = "mock"
 
-    def complete(self, model: str, messages: list[ChatMessage]) -> CompletionResult:
+    # Simulated per-token delay so streaming is visibly incremental in the UI
+    # and cancellation has a window in which to take effect.
+    chunk_delay_seconds = 0.04
+
+    def _build_reply(self, model: str, messages: list[ChatMessage]) -> str:
         user_messages = [m for m in messages if m.role == "user"]
         latest = user_messages[-1].content if user_messages else ""
         turn_count = len(user_messages)
 
-        content = (
+        return (
             f'You said: "{latest}"\n\n'
             f"This is turn {turn_count} of our conversation, and I can see "
             f"{len(messages)} message(s) of context. "
             "I'm the mock provider — set LLM_PROVIDER=openrouter with an API key "
             "for real completions."
         )
+
+    def complete(self, model: str, messages: list[ChatMessage]) -> CompletionResult:
+        content = self._build_reply(model, messages)
 
         # Rough word-based estimate; real providers report exact usage.
         prompt_tokens = sum(len(m.content.split()) for m in messages)
@@ -77,6 +104,28 @@ class MockProvider:
             model=model,
             prompt_tokens=prompt_tokens,
             completion_tokens=len(content.split()),
+        )
+
+    def stream(self, model: str, messages: list[ChatMessage]) -> Iterator[StreamChunk]:
+        import time
+
+        content = self._build_reply(model, messages)
+        words = content.split(" ")
+        prompt_tokens = sum(len(m.content.split()) for m in messages)
+
+        for index, word in enumerate(words):
+            # Preserve spacing so the reassembled text matches `complete()`.
+            delta = word if index == 0 else f" {word}"
+            yield StreamChunk(delta=delta, provider=self.name, model=model)
+            time.sleep(self.chunk_delay_seconds)
+
+        yield StreamChunk(
+            delta="",
+            provider=self.name,
+            model=model,
+            is_final=True,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=len(words),
         )
 
 
@@ -131,6 +180,79 @@ class OpenRouterProvider:
             model=body.get("model") or model,
             prompt_tokens=usage.get("prompt_tokens"),
             completion_tokens=usage.get("completion_tokens"),
+        )
+
+    def stream(self, model: str, messages: list[ChatMessage]) -> Iterator[StreamChunk]:
+        """Parse OpenRouter's SSE stream into normalized chunks."""
+        payload = {
+            "model": model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "stream": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
+        resolved_provider = self.name
+        resolved_model = model
+        prompt_tokens: int | None = None
+        completion_tokens: int | None = None
+
+        try:
+            with httpx.stream(
+                "POST",
+                f"{self._base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=self._timeout,
+            ) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise ProviderError(
+                        f"OpenRouter returned {response.status_code}: {response.text[:200]}"
+                    )
+
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+
+                    data = line[len("data: ") :].strip()
+                    if data == "[DONE]":
+                        break
+
+                    try:
+                        event = json.loads(data)
+                    except ValueError:
+                        # Keepalive or partial frame; skip rather than fail the stream.
+                        continue
+
+                    resolved_provider = event.get("provider") or resolved_provider
+                    resolved_model = event.get("model") or resolved_model
+
+                    if usage := event.get("usage"):
+                        prompt_tokens = usage.get("prompt_tokens")
+                        completion_tokens = usage.get("completion_tokens")
+
+                    choices = event.get("choices") or []
+                    if not choices:
+                        continue
+
+                    delta = (choices[0].get("delta") or {}).get("content")
+                    if delta:
+                        yield StreamChunk(
+                            delta=delta, provider=resolved_provider, model=resolved_model
+                        )
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"OpenRouter stream failed: {exc}") from exc
+
+        yield StreamChunk(
+            delta="",
+            provider=resolved_provider,
+            model=resolved_model,
+            is_final=True,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )
 
 

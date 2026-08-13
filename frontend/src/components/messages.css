@@ -76,6 +76,23 @@
   background: oklch(76% 0.15 68 / 0.07);
 }
 
+/* Blinking caret marks the live streaming edge. */
+.cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--color-accent);
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
 .bubble__body--pending {
   display: flex;
   gap: 5px;
