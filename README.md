@@ -95,7 +95,7 @@ running the API without a broker.
 
 | Bonus | Status | Evidence |
 |---|---|---|
-| Multi-provider support | **Done** | Two adapters behind one interface; logs show real calls to both `mock` and `Nvidia` (via OpenRouter). Switching is a one-line `LLM_MODEL` change |
+| Multi-provider support | **Done** | Three adapters (`mock`, `openrouter`, `anthropic`) behind one interface. See [Multi-provider: the evidence](#multi-provider-the-evidence) |
 | Streaming responses | **Done** | SSE, token-by-token; verified incremental in a real browser |
 | Latency / throughput / error dashboards | **Done** | 5 aggregation endpoints + 3 charts + provider breakdown, aggregated in SQL |
 | Docker Compose one-command setup | **Done** | `docker compose up --build` brings up all 5 services from a wiped volume |
@@ -433,6 +433,81 @@ and others by changing `LLM_MODEL` alone. Free models carry a `:free` suffix.
 `nvidia/nemotron-3.5-lightning:free` — blocking calls, token-by-token SSE streaming,
 queue processing, and dashboard aggregation all confirmed in the browser. Error
 handling was separately confirmed against a real 401.
+
+---
+
+## Multi-provider: the evidence
+
+"Multi-provider support" is easy to claim and easy to fake — an aggregator plus a
+mock does not prove an abstraction. Here is what actually backs it.
+
+### 1. Three adapters, one interface
+
+| Adapter | Wire format | Purpose |
+|---|---|---|
+| `MockProvider` | none | Runs the stack with no credentials |
+| `OpenRouterProvider` | OpenAI-compatible | One key, many upstream vendors |
+| `AnthropicProvider` | Anthropic Messages API | **Deliberately not OpenAI-shaped** |
+
+The Anthropic adapter is the one that matters. If every provider spoke the same
+dialect, the interface would be proving nothing. Anthropic differs on six axes the
+adapter has to absorb:
+
+| | OpenAI-shaped | Anthropic |
+|---|---|---|
+| Auth | `Authorization: Bearer` | `x-api-key` + `anthropic-version` |
+| System prompt | a message with `role="system"` | top-level `system` field |
+| `max_tokens` | optional | **required** |
+| Response text | `choices[0].message.content` | `content[]` block list |
+| Usage keys | `prompt_tokens` / `completion_tokens` | `input_tokens` / `output_tokens` |
+| Stream events | `choices[].delta` | typed `content_block_delta` |
+
+Callers see none of this. Both return the same `CompletionResult`, and there is a
+[test asserting exactly that](backend/tests/test_providers.py) — same content, same
+token counts, from two different wire formats.
+
+### 2. Live calls across distinct vendors
+
+Routed through OpenRouter, each logged with the provider that actually served it:
+
+| Requested model | Logged provider | Tokens |
+|---|---|---|
+| `nvidia/nemotron-3.5-lightning:free` | `Nvidia` | 21 in / 119 out |
+| `google/gemma-4-26b-a4b-it:free` | `Darkbloom` | 18 in / 2 out |
+| `openai/gpt-oss-20b:free` | `Darkbloom` | 72 in / 41 out |
+
+Note that `provider` records the **serving infrastructure**, which is not always the
+model's author — Darkbloom served both the Google and OpenAI models. That is real
+information about who handled the request, and it is exactly why the log stores the
+resolved value instead of the requested one.
+
+### 3. Real API contact, without a key
+
+The Anthropic adapter was exercised against the live API with a deliberately invalid
+key. Both paths returned:
+
+```
+Anthropic returned 401: {"type":"error","error":{"type":"authentication_error",
+"message":"invalid x-api-key"},"request_id":"req_011Cdznatfakg7qvY84t9daw"}
+```
+
+An `authentication_error` — rather than a 404, a 400, or a schema complaint — proves
+the endpoint, headers, and request body are correct and that only the credential was
+rejected. The error also parses cleanly on both the blocking and streaming paths.
+
+### 4. Tests that would catch a regression
+
+[`test_providers.py`](backend/tests/test_providers.py) — 14 tests, no keys, no
+network. They assert the system prompt is hoisted, the right auth header is used,
+content blocks are joined, tool-use blocks are excluded, streaming events are parsed,
+the factory rejects unknown providers and missing keys, and every adapter implements
+the full interface.
+
+### What would make this stronger
+
+A successful call with a valid Anthropic key. The request shape is confirmed correct
+by the 401, but the response parser has only been exercised against stubs and the
+error path — not a real 200.
 
 Switching providers requires no code change. The logging layer, queue, worker, and
 dashboard are all provider-agnostic.

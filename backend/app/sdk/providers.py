@@ -256,6 +256,157 @@ class OpenRouterProvider:
         )
 
 
+class AnthropicProvider:
+    """Anthropic's native Messages API.
+
+    Deliberately not OpenAI-shaped, and that is the point: it proves the adapter
+    interface abstracts a genuinely different API rather than assuming every
+    provider speaks the same dialect. Differences handled here:
+
+      - auth via `x-api-key` + `anthropic-version`, not a Bearer token
+      - `system` is a top-level field, not a message with role="system"
+      - `max_tokens` is required, not optional
+      - responses carry a `content` block list, not `choices[].message.content`
+      - usage keys are `input_tokens`/`output_tokens`
+      - streaming emits typed events (`content_block_delta`), not `choices` deltas
+    """
+
+    name = "anthropic"
+
+    API_VERSION = "2023-06-01"
+    # Anthropic requires this; the value bounds the reply, it does not reserve cost.
+    DEFAULT_MAX_TOKENS = 4096
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://api.anthropic.com/v1",
+        timeout: float = 60.0,
+    ) -> None:
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": self._api_key,
+            "anthropic-version": self.API_VERSION,
+            "content-type": "application/json",
+        }
+
+    def _payload(self, model: str, messages: list[ChatMessage], stream: bool) -> dict:
+        # Anthropic rejects role="system" inside messages; it must be hoisted.
+        system_parts = [m.content for m in messages if m.role == "system"]
+        turns = [
+            {"role": m.role, "content": m.content} for m in messages if m.role != "system"
+        ]
+
+        payload: dict = {
+            "model": model,
+            "messages": turns,
+            "max_tokens": self.DEFAULT_MAX_TOKENS,
+            "stream": stream,
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts)
+        return payload
+
+    def complete(self, model: str, messages: list[ChatMessage]) -> CompletionResult:
+        try:
+            response = httpx.post(
+                f"{self._base_url}/messages",
+                json=self._payload(model, messages, stream=False),
+                headers=self._headers(),
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderError(
+                f"Anthropic returned {exc.response.status_code}: {exc.response.text[:200]}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"Anthropic request failed: {exc}") from exc
+        except ValueError as exc:
+            raise ProviderError(f"Anthropic returned non-JSON body: {exc}") from exc
+
+        # Content is a list of typed blocks; join the text ones.
+        try:
+            content = "".join(
+                block.get("text", "")
+                for block in body.get("content", [])
+                if block.get("type") == "text"
+            )
+        except (AttributeError, TypeError) as exc:
+            raise ProviderError(f"Unexpected Anthropic response shape: {str(body)[:200]}") from exc
+
+        usage = body.get("usage") or {}
+        return CompletionResult(
+            content=content,
+            provider=self.name,
+            model=body.get("model") or model,
+            prompt_tokens=usage.get("input_tokens"),
+            completion_tokens=usage.get("output_tokens"),
+        )
+
+    def stream(self, model: str, messages: list[ChatMessage]) -> Iterator[StreamChunk]:
+        resolved_model = model
+        prompt_tokens: int | None = None
+        completion_tokens: int | None = None
+
+        try:
+            with httpx.stream(
+                "POST",
+                f"{self._base_url}/messages",
+                json=self._payload(model, messages, stream=True),
+                headers=self._headers(),
+                timeout=self._timeout,
+            ) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise ProviderError(
+                        f"Anthropic returned {response.status_code}: {response.text[:200]}"
+                    )
+
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+
+                    try:
+                        event = json.loads(line[len("data: ") :])
+                    except ValueError:
+                        continue
+
+                    event_type = event.get("type")
+
+                    if event_type == "message_start":
+                        message = event.get("message") or {}
+                        resolved_model = message.get("model") or resolved_model
+                        prompt_tokens = (message.get("usage") or {}).get("input_tokens")
+                    elif event_type == "content_block_delta":
+                        text = (event.get("delta") or {}).get("text")
+                        if text:
+                            yield StreamChunk(
+                                delta=text, provider=self.name, model=resolved_model
+                            )
+                    elif event_type == "message_delta":
+                        # Output tokens are only final on this event.
+                        completion_tokens = (event.get("usage") or {}).get("output_tokens")
+                    elif event_type == "message_stop":
+                        break
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"Anthropic stream failed: {exc}") from exc
+
+        yield StreamChunk(
+            delta="",
+            provider=self.name,
+            model=resolved_model,
+            is_final=True,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+
 def build_provider(settings: Settings) -> Provider:
     """Resolve the configured provider, failing loudly on bad configuration."""
     name = settings.llm_provider.lower()
@@ -270,5 +421,13 @@ def build_provider(settings: Settings) -> Provider:
                 "LLM_PROVIDER=openrouter requires OPENROUTER_API_KEY to be set."
             )
         return OpenRouterProvider(api_key=api_key, base_url=settings.openrouter_base_url)
+
+    if name == "anthropic":
+        api_key = settings.anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ProviderError(
+                "LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY to be set."
+            )
+        return AnthropicProvider(api_key=api_key, base_url=settings.anthropic_base_url)
 
     raise ProviderError(f"Unknown LLM_PROVIDER: {settings.llm_provider!r}")

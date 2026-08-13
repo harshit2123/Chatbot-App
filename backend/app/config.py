@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
+    anthropic_api_key: str | None = None
+    anthropic_base_url: str = "https://api.anthropic.com/v1"
+
     # Where the SDK wrapper posts log events. Kept as a URL rather than an
     # in-process call so the wrapper stays transport-identical to how it would
     # behave from a separate service.
