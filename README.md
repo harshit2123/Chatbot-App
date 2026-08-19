@@ -22,13 +22,15 @@ database is slow, and cannot be something a developer has to remember to add.
 - [How it maps to the requirements](#how-it-maps-to-the-requirements)
 - [Architecture](#architecture)
   - [The path of a single message](#the-path-of-a-single-message)
+  - [Repository layout](#repository-layout)
   - [Component responsibilities](#component-responsibilities)
   - [Why instrumentation is automatic](#why-instrumentation-is-automatic)
   - [Durable log delivery](#durable-log-delivery)
-  - [Why ingestion is decoupled from storage](#why-ingestion-is-decoupled-from-storage)
+  - [Why ingestion is decoupled from chat](#why-ingestion-is-decoupled-from-chat)
   - [Streaming](#streaming)
   - [Cancellation](#cancellation)
   - [Failure handling](#failure-handling)
+- [The telemetry SDK](#the-telemetry-sdk)
 - [Database schema](#database-schema)
 - [PII redaction](#pii-redaction)
 - [API reference](#api-reference)
@@ -71,15 +73,18 @@ docker compose up -d postgres redis
 
 cd backend
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# The telemetry SDK is a separate package, installed like any dependency.
+.venv/bin/pip install -e ../sdk
 cp .env.example .env
 .venv/bin/uvicorn app.main:app --reload
 
-# Frontend, third shell
+# Frontend, second shell
 cd frontend && npm install && npm run dev
 ```
 
-The telemetry SDK is a standalone package: `pip install -e ./sdk` installs it, and
-the backend imports it as `llmlog` like any third-party library.
+`llmlog` is not part of the backend package — it is a standalone library that lives
+in [`sdk/`](sdk/) and is installed into the venv. The backend imports it exactly as
+any other project would. See [The telemetry SDK](#the-telemetry-sdk).
 
 **Migrations** run automatically on startup (`alembic upgrade head`). To manage them
 by hand:
@@ -98,7 +103,7 @@ cd backend
 | # | Requirement | Implementation |
 |---|---|---|
 | 1 | Multi-turn chatbot, short context, simple UI | React chat with streaming, conversation list, and resume. History trimmed to the last `HISTORY_TURN_LIMIT` messages (default 20) before each call |
-| 2 | SDK capturing inference metadata, **auto-instrumenting** | One wrapper wraps every call. Provider adapters contain zero logging code — a new provider is instrumented for free |
+| 2 | SDK capturing inference metadata, **auto-instrumenting** | A standalone `llmlog` package records every call. Provider adapters contain zero logging code — a new provider is instrumented for free |
 | 2 | Sends logs in near real time | Pushed over HTTP the moment a call terminates, not batched |
 | 3 | Ingestion: receive → validate → extract → store | `/ingest` receives, validates with Pydantic, redacts PII, and persists idempotently. Producers never block on it: the SDK spools to disk and delivers in the background |
 | 4 | Store messages, logs, extracted metadata | `conversations`, `messages`, `inference_logs`, with metadata in typed columns |
@@ -188,7 +193,7 @@ llmlog`, point it at a collector, and instrument.
    failure can never lose what the user typed.
 3. **Context is trimmed** to the last N messages, newest-first via `LIMIT`, then
    re-reversed to chronological order.
-4. **The wrapper starts a timer** and calls the provider adapter.
+4. **A span opens** — the timer starts — and the provider adapter is called.
 5. **Tokens stream back.** Each chunk is forwarded to the browser as an SSE `delta`
    frame and accumulated. Between chunks, the loop checks the cancellation flag.
 6. **The stream terminates** — completed, failed, or cancelled. All three paths emit
@@ -200,6 +205,36 @@ llmlog`, point it at a collector, and instrument.
    is cleared only once the endpoint confirms acceptance.
 9. **The assistant reply is persisted** and the final SSE frame closes the stream.
 10. **The dashboard** aggregates in Postgres on demand.
+
+### Repository layout
+
+```text
+sdk/                             standalone telemetry library — no app imports
+  llmlog/
+    __init__.py                  public API: configure, record, record_stream
+    config.py                    LogConfig + LLMLOG_* env reading
+    record.py                    Span, and the four stream terminations
+    client.py                    spool -> background POST -> replay
+    spool.py                     crash-safe on-disk queue
+  pyproject.toml                 pip install -e ./sdk
+
+backend/app/
+  llm/providers.py               mock · OpenRouter · Anthropic adapters
+  telemetry/
+    instrument.py                binds llmlog to the provider shapes above
+    pii.py                       redaction, applied before persistence
+  api/
+    conversations.py             chat turns, SSE streaming, cancellation
+    ingest.py                    validate -> redact -> persist
+    metrics.py                   SQL aggregation for the dashboard
+  db/ · models/ · config.py      schema, Pydantic boundary, settings
+
+frontend/                        React chat UI + observability dashboard
+k8s/                             Deployments, StatefulSets, HPA (not applied)
+```
+
+The top-level split is the point: `sdk/` depends on nothing in `backend/`, and only
+`telemetry/instrument.py` knows both sides.
 
 ### Component responsibilities
 
@@ -214,9 +249,9 @@ llmlog`, point it at a collector, and instrument.
 
 ### Why instrumentation is automatic
 
-There is **one instrumented call site per mode** (blocking and streaming), and both
-are provider-agnostic. Adding a provider means writing one class with `complete()`
-and `stream()`:
+There is **one instrumented call site per mode** (blocking and streaming), both in
+[`instrument.py`](backend/app/telemetry/instrument.py), and both provider-agnostic.
+Adding a provider means writing one class with `complete()` and `stream()`:
 
 ```python
 class AnthropicProvider:
@@ -230,13 +265,28 @@ captured with full metadata automatically.
 
 This matters because **manual instrumentation rots**. Any approach where a developer
 must remember to log at each call site eventually has unlogged call sites. Here,
-forgetting is not possible — the only path to the model runs through the wrapper.
+forgetting is not possible — the only path to the model runs through those two
+functions.
+
+**The layering is worth being precise about**, because it is what makes the SDK
+reusable. Three layers, each ignorant of the one beside it:
+
+```
+app/llm/providers.py       makes the model call     · knows nothing about logging
+app/telemetry/instrument.py maps one onto the other · the only file that knows both
+sdk/llmlog/                 records and delivers    · knows nothing about providers
+```
+
+An earlier revision put the provider call *inside* the SDK — the SDK invoked the
+model and logged it in one function. That worked, but it meant the SDK imported the
+application's settings and provider classes, so it could never be lifted into
+another project. Splitting the two is what turned it into a library.
 
 ### Durable log delivery
 
-The wrapper writes each event to an on-disk spool **before** attempting the POST,
-and removes it only once the endpoint confirms acceptance. Without that ordering,
-an ingestion outage silently discarded telemetry — the exact blind spot this system
+The SDK writes each event to an on-disk spool **before** attempting the POST, and
+removes it only once the endpoint confirms acceptance. Without that ordering, an
+ingestion outage silently discarded telemetry — the exact blind spot this system
 exists to prevent.
 
 ```
@@ -326,6 +376,88 @@ HTTP request.
 | Generation cancelled | Logged `status=cancelled` with partial output preserved |
 | Ingestion endpoint unreachable | The event is already on the durable spool; a background loop replays it once ingestion recovers |
 | Process crash / power loss mid-delivery | The spool entry survives on disk (`fsync` before rename) and is replayed on the next run |
+
+---
+
+## The telemetry SDK
+
+[`sdk/`](sdk/) is a standalone, installable Python package with **no import of this
+application**. That is the whole design constraint: it never makes a model call,
+never imports a provider, and never sees this app's settings object. It records that
+a call happened.
+
+```bash
+pip install -e ./sdk        # httpx is its only dependency
+```
+
+### Using it
+
+```python
+import llmlog
+
+llmlog.configure(ingest_url="http://collector:8000/ingest")
+llmlog.start_replay_worker()
+
+with llmlog.record(model="gpt-4", input_text=prompt) as span:
+    reply = my_client.complete(prompt)          # llmlog never sees this call
+    span.succeeded(output=reply.text, completion_tokens=reply.usage.output)
+```
+
+Streaming, including cancellation and mid-stream client disconnect:
+
+```python
+def to_delta(span, chunk):
+    if chunk.done:
+        span.succeeded(completion_tokens=chunk.usage)
+        return None                              # swallow the usage-only frame
+    return chunk.text
+
+for chunk in llmlog.record_stream(provider_iter, model="gpt-4", on_chunk=to_delta):
+    yield chunk
+```
+
+`on_chunk` is the seam. It maps a caller-defined chunk onto the span and returns the
+text delta to accumulate — the one place the SDK touches a provider's shape, and the
+caller supplies it. This app's version is
+[`_on_chunk`](backend/app/telemetry/instrument.py), about ten lines.
+
+### Layout
+
+| Module | Responsibility |
+|---|---|
+| [`config.py`](sdk/llmlog/config.py) | A frozen dataclass with its own `LLMLOG_*` env reading. Every field has a working default, so `LogConfig()` alone starts |
+| [`record.py`](sdk/llmlog/record.py) | `Span` and the two recording shapes. All four stream terminations resolve here |
+| [`client.py`](sdk/llmlog/client.py) | Spool → background POST → replay. Owns the durability contract |
+| [`spool.py`](sdk/llmlog/spool.py) | Crash-safe on-disk queue: one JSON file per event, `fsync` then atomic rename |
+
+`LogClient` is an instance, not module globals: two clients pointed at different
+collectors can coexist, and tests build a throwaway one instead of monkeypatching
+module state.
+
+### The guarantee
+
+**Exactly one event per call, however the call ends.** A generation can terminate
+four ways, and all four are handled:
+
+| Termination | Status | Note |
+|---|---|---|
+| Stream completes | `success` | Token counts arrive on the final frame |
+| Provider raises | `error` | Logged, then re-raised — error rate is only measurable if failures are recorded |
+| Caller cancels | `cancelled` | Partial output preserved |
+| Consumer walks away | `cancelled` | `GeneratorExit` derives from `BaseException`, so it needs its own branch; a `finally` backstop covers ASGI abandonment |
+
+An unlogged model call is the one outcome an observability tool must never have.
+
+### Collector contract
+
+Events are POSTed as JSON to `ingest_url`. Any 2xx means accepted. A 4xx other than
+`408`/`429` is terminal — the event is dropped rather than retried forever behind a
+permanently bad payload. `5xx`, `408`, `429`, and transport failures are retried
+from the spool. Events carry a producer-generated `id`, so the collector can make its
+write idempotent and a replayed event cannot double-write.
+
+Any HTTP endpoint accepting that shape works as a collector. This app's happens to be
+[`/ingest`](backend/app/api/ingest.py).
 
 ---
 
@@ -435,7 +567,7 @@ Presidio is the upgrade path.
 | POST | `/conversations/{id}/messages` | Send, blocking response |
 | POST | `/conversations/{id}/messages/stream` | Send, **SSE streaming** response |
 | POST | `/conversations/{id}/cancel` | Cancel an in-flight generation |
-| POST | `/ingest` | Receive a log event from the SDK wrapper |
+| POST | `/ingest` | Receive a log event from the SDK |
 | GET | `/logs` | Read stored logs |
 | GET | `/metrics/summary` | Totals, error rate, avg/p95 latency, tokens |
 | GET | `/metrics/latency` | Latency time series |
@@ -454,9 +586,10 @@ All via environment variables; see [`.env.example`](backend/.env.example).
 |---|---|---|
 | `DATABASE_URL` | local Postgres | Connection string |
 | `REDIS_URL` | `redis://localhost:6379/0` | Cancellation flags (falls back to process memory) |
-| `LLM_PROVIDER` | `mock` | `mock` or `openrouter` |
+| `LLM_PROVIDER` | `mock` | `mock`, `openrouter`, or `anthropic` |
 | `LLM_MODEL` | `mock/echo-1` | Model id passed to the provider |
 | `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
+| `ANTHROPIC_API_KEY` | — | Required when provider is `anthropic` |
 | `INGEST_URL` | `http://127.0.0.1:8000/ingest` | Where the SDK posts log events |
 | `SPOOL_ENABLED` | `true` | Durable on-disk spool for log events |
 | `SPOOL_DIR` | `/tmp/llm-log-spool` | Where spooled events are written |
@@ -466,11 +599,17 @@ All via environment variables; see [`.env.example`](backend/.env.example).
 | `CANCEL_FLAG_TTL_SECONDS` | `600` | Cancellation flag lifetime |
 | `CORS_ORIGINS` | localhost + 127.0.0.1 :5173 | Allowed browser origins |
 
+These are the **application's** settings. The backend reads them and hands the
+relevant ones to the SDK at startup via `configure_telemetry()`. Used standalone in
+another project, the SDK reads its own `LLMLOG_*` variables instead — see
+[The telemetry SDK](#the-telemetry-sdk) — so it carries no dependency on the naming
+above.
+
 `INGEST_URL` uses `127.0.0.1` rather than `localhost` deliberately: on macOS
 `localhost` resolves to `::1` first, so an unrelated process bound to IPv6 `:8000`
 would silently receive the log events instead of this app. That is not hypothetical —
 it happened during development, and every log was being swallowed by another
-container until the wrapper started checking response status.
+container until the SDK started checking response status.
 
 ---
 
@@ -491,10 +630,9 @@ and others by changing `LLM_MODEL` alone. Free models carry a `:free` suffix.
 log processing, and dashboard aggregation all confirmed in the browser. Error
 handling was separately confirmed against a real 401.
 
-That browser run predates the removal of the Celery worker. The provider and
-streaming paths it exercised are unchanged, but the ingestion path has since been
-rewritten; it has been verified by the test suite and against a stub collector over
-real HTTP, not re-confirmed in a browser against a live provider.
+That run predates the SDK extraction — the provider and streaming paths it exercised
+are unchanged, but see [Verification audit](#verification-audit) for what has and has
+not been re-measured since.
 
 ---
 
@@ -582,8 +720,13 @@ dashboard are all provider-agnostic.
 cd backend && .venv/bin/python -m pytest
 ```
 
-**98 tests, no skips.** Each suite creates its own isolated database on demand, so
-the suite runs from a clean machine with only Postgres up.
+**91 tests.** Each suite creates its own isolated database on demand, so the suite
+runs from a clean machine with only Postgres up. The 30 database-backed tests skip
+if Postgres is unreachable; the other 61 run anywhere.
+
+(It was 98 before the Celery worker was removed — `test_worker.py` and its 7 tests
+went with it. `test_spool.py` was rewritten against the SDK's `LogClient` API rather
+than the module globals it replaced; every assertion in it survived the move.)
 
 Two testing decisions worth noting. Suites get **separate databases** so seeded row
 counts stay deterministic when run together, and a `conftest` snapshots the
@@ -609,6 +752,11 @@ Beyond unit and integration tests, the full stack was verified through a real br
 mid-stream cancellation producing a `cancelled` log, resume after reload, dashboard
 rendering, and no console errors at any viewport.
 
+**That browser run predates the SDK extraction.** The chat, streaming, and dashboard
+paths it exercised are unchanged, but the ingestion path was rewritten afterward and
+has been verified by the suite and against a stub collector over real HTTP — not
+re-confirmed in a browser. See [Verification audit](#verification-audit).
+
 ### A bug worth documenting
 
 The queue silently was not being used. `@shared_task` binds to whichever Celery app
@@ -630,9 +778,16 @@ producer's spool. The queue has since been removed entirely; see
 
 ## Verification audit
 
-Every claim in this README was re-checked against the running system rather than
-assumed from the code. This section records what was tested, the observed result,
-and how to reproduce it. Where a claim did **not** hold, that is stated too.
+Every claim in this README was checked against a running system rather than assumed
+from the code. This section records what was tested, the observed result, and how to
+reproduce it. Where a claim did **not** hold, that is stated too.
+
+**Status after the SDK extraction.** The instrumentation and durability claims below
+were re-run against the current architecture and are reproduced verbatim from that
+run. The browser-based checks (live provider traffic, dashboard rendering) date from
+before the Celery worker was removed and have **not** been repeated — the paths they
+covered are unchanged, but that is an argument, not a measurement, and is labelled as
+such where it appears.
 
 ### Automatic instrumentation
 
@@ -658,14 +813,18 @@ latency_ms         0
 prompt_tokens      7
 completion_tokens  3
 status             success
-started_at         2026-08-13T13:00:33.083492+00:00
+started_at         2026-08-19T19:08:50.140232+00:00
 ```
 
-Supporting evidence: `grep` for logging calls inside
-[`providers.py`](backend/app/llm/providers.py) and
-[`conversations.py`](backend/app/api/conversations.py) returns **no** matches
-outside docstrings. Neither the provider layer nor the API layer contains
-instrumentation — it lives entirely in the wrapper between them.
+Re-run after the SDK extraction, and it still holds: the provider class above is
+handed to `instrumented_completion()` and never touches `llmlog` itself.
+
+Supporting evidence: `grep -c "llmlog\|emit\|log_event"` returns **0** matches in
+[`conversations.py`](backend/app/api/conversations.py) and exactly **1** in
+[`providers.py`](backend/app/llm/providers.py) — a docstring on line 271 describing
+Anthropic's event shape, not a call. Neither the provider layer nor the API layer
+contains instrumentation; it lives entirely in
+[`instrument.py`](backend/app/telemetry/instrument.py) between them.
 
 ### Asynchronous ingestion
 
@@ -778,8 +937,9 @@ Verification is only worth doing if it can fail. It did, four times:
    so every enqueue from the API failed with "Connection refused" and fell back to a
    synchronous write. Redaction and persistence still worked, so the system looked
    correct end to end. Caught by inspecting worker logs rather than trusting that
-   rows appeared.
-2. **Log delivery deadlocked on streaming requests.** The wrapper POSTed to an
+   rows appeared. *(The queue has since been removed outright — that the system was
+   fully correct without it is what made the case.)*
+2. **Log delivery deadlocked on streaming requests.** The instrumentation POSTed to an
    endpoint served by the same single-worker process while that process was busy
    streaming; the request timed out and the log was lost. Delivery now runs on a
    background thread pool.
@@ -803,15 +963,24 @@ failure mode, and only checking the plumbing — not the output — surfaces it.
 - **The Anthropic adapter has never received a real 200.** Request shape is
   confirmed by the live `401`; the success-path response parser is exercised only
   against stubs.
-- **Client-disconnect logging is unreliable** — see [Known limitations](#known-limitations).
+- **Client-disconnect logging depends on generator finalization** — see
+  [Known limitations](#known-limitations).
+- **The post-extraction system has not been run under Docker Compose or in a
+  browser.** The suite passes and the SDK was exercised against a stub collector over
+  real HTTP, but the four-service stack was not brought up after the worker was
+  removed — Docker was unavailable on the machine where that work was done. The
+  Compose and k8s changes are structural edits, not verified deployments.
 
 ### Reproducing this
 
 ```bash
 docker compose up -d --build
-pip install -e ./sdk                            # the telemetry SDK is standalone
-cd backend && .venv/bin/python -m pytest
 curl -s localhost:8000/metrics/summary?window_minutes=60
+
+# Tests, against a venv with the SDK installed:
+cd backend
+.venv/bin/pip install -e ../sdk
+.venv/bin/python -m pytest
 ```
 
 ---
