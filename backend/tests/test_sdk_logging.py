@@ -14,8 +14,8 @@ import uuid
 import pytest
 
 from app.config import Settings
-from app.sdk.logging import instrumented_completion
-from app.sdk.providers import ChatMessage, CompletionResult, ProviderError
+from app.telemetry.instrument import instrumented_completion
+from app.llm.providers import ChatMessage, CompletionResult, ProviderError
 
 
 def _wait_for(predicate, timeout: float = 5.0) -> bool:
@@ -35,25 +35,26 @@ def _wait_for(predicate, timeout: float = 5.0) -> bool:
 
 @pytest.fixture
 def settings() -> Settings:
-    # Pinned explicitly: other suites set INGEST_SYNC/SPOOL_* in the process
-    # environment, and Settings() would otherwise pick them up and silently
-    # change which delivery path is under test.
+    # Pinned explicitly: other suites set SPOOL_* in the process environment,
+    # and Settings() would otherwise pick them up and silently change which
+    # delivery path is under test.
     return Settings(
         database_url="postgresql+psycopg://unused/unused",
         ingest_url="http://ingest.invalid/ingest",
         preview_max_chars=50,
-        ingest_sync=False,
         spool_enabled=False,
     )
 
 
 @pytest.fixture
-def captured(monkeypatch) -> list[dict]:
+def captured(settings) -> list[dict]:
     """Capture emitted log events instead of sending them over HTTP."""
+    import llmlog
+    from app.telemetry.instrument import configure_telemetry
+
+    configure_telemetry(settings)
     events: list[dict] = []
-    monkeypatch.setattr(
-        "app.sdk.logging.emit_log_event", lambda event, settings: events.append(event)
-    )
+    llmlog.get_client().emit = events.append
     return events
 
 
@@ -86,7 +87,6 @@ def test_successful_call_logs_full_metadata(settings, captured):
         provider=provider,
         model="requested-model",
         messages=[ChatMessage(role="user", content="hello")],
-        settings=settings,
         conversation_id=conversation_id,
         message_id=None,
     )
@@ -116,7 +116,6 @@ def test_resolved_provider_and_model_are_logged_not_requested_ones(settings, cap
         provider=provider,
         model="auto",
         messages=[ChatMessage(role="user", content="hello")],
-        settings=settings,
         conversation_id=str(uuid.uuid4()),
     )
 
@@ -132,7 +131,6 @@ def test_provider_failure_is_logged_then_reraised(settings, captured):
             provider=provider,
             model="m",
             messages=[ChatMessage(role="user", content="hello")],
-            settings=settings,
             conversation_id=str(uuid.uuid4()),
         )
 
@@ -151,7 +149,6 @@ def test_unexpected_exception_is_also_logged(settings, captured):
             provider=provider,
             model="m",
             messages=[ChatMessage(role="user", content="hello")],
-            settings=settings,
             conversation_id=str(uuid.uuid4()),
         )
 
@@ -169,7 +166,6 @@ def test_previews_are_truncated_to_budget(settings, captured):
         provider=provider,
         model="m",
         messages=[ChatMessage(role="user", content="y" * 500)],
-        settings=settings,
         conversation_id=str(uuid.uuid4()),
     )
 
@@ -197,7 +193,6 @@ def test_transport_failure_does_not_break_the_call(settings, monkeypatch):
         provider=provider,
         model="m",
         messages=[ChatMessage(role="user", content="hello")],
-        settings=settings,
         conversation_id=str(uuid.uuid4()),
     )
 
@@ -232,7 +227,6 @@ def test_delivery_does_not_block_the_caller(settings, monkeypatch):
         provider=provider,
         model="m",
         messages=[ChatMessage(role="user", content="hello")],
-        settings=settings,
         conversation_id=str(uuid.uuid4()),
     )
     elapsed = time.perf_counter() - start
@@ -256,7 +250,8 @@ def test_non_2xx_ingest_response_is_not_treated_as_delivered(settings, monkeypat
     """
     import httpx
 
-    from app.sdk.logging import _post
+    from llmlog.client import LogClient
+    from llmlog.config import LogConfig
 
     def responding(status: int):
         class FakeResponse:
@@ -265,19 +260,23 @@ def test_non_2xx_ingest_response_is_not_treated_as_delivered(settings, monkeypat
 
         return lambda *a, **k: FakeResponse()
 
+    client = LogClient(
+        LogConfig(ingest_url="http://ingest.invalid/ingest", spool_enabled=False)
+    )
+
     # Terminal: discard rather than retry forever.
     monkeypatch.setattr(httpx, "post", responding(400))
-    assert _post({"id": "a"}, settings) is True
+    assert client.post({"id": "a"}) is True
 
     monkeypatch.setattr(httpx, "post", responding(422))
-    assert _post({"id": "b"}, settings) is True
+    assert client.post({"id": "b"}) is True
 
     # Retryable: the event must be kept for a later attempt.
     monkeypatch.setattr(httpx, "post", responding(503))
-    assert _post({"id": "c"}, settings) is False
+    assert client.post({"id": "c"}) is False
 
     monkeypatch.setattr(httpx, "post", responding(429))
-    assert _post({"id": "d"}, settings) is False, "rate limiting is temporary"
+    assert client.post({"id": "d"}) is False, "rate limiting is temporary"
 
     monkeypatch.setattr(httpx, "post", responding(202))
-    assert _post({"id": "e"}, settings) is True
+    assert client.post({"id": "e"}) is True

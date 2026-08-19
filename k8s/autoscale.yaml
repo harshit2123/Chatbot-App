@@ -1,64 +1,18 @@
-# Worker autoscaling.
+# Backend autoscaling.
 #
-# The signal that matters for a queue consumer is backlog depth, not CPU. A
-# worker blocked on a slow database burns almost no CPU while the queue grows —
-# CPU-based autoscaling would hold at minReplicas through exactly the incident
-# where more consumers are needed.
+# This used to be a KEDA ScaledObject scaling queue consumers on Redis backlog
+# depth — the right signal when a queue existed. Ingestion is now a synchronous
+# write inside the API, so there is no backlog to read and no separate consumer
+# to scale. What remains is a plain request-serving deployment, and CPU is an
+# honest signal for that.
 #
-# KEDA's Redis scaler reads list length directly. Requires KEDA installed:
-#   helm install keda kedacore/keda -n keda --create-namespace
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: worker-scaler
-  namespace: llm-logs
-spec:
-  scaleTargetRef:
-    name: worker
-  minReplicaCount: 2
-  maxReplicaCount: 20
-  pollingInterval: 15
-  # Well above the longest expected task so a burst does not thrash replicas.
-  cooldownPeriod: 120
-  triggers:
-    - type: redis
-      metadata:
-        address: redis.llm-logs.svc.cluster.local:6379
-        # Celery's default queue name.
-        listName: celery
-        # Scale up when the average backlog per worker exceeds this.
-        listLength: "50"
----
-# Fallback if KEDA is not available. Kept commented rather than applied: it
-# scales on the wrong signal, and shipping it silently would undercut the point
-# above. Uncomment only if custom metrics are genuinely unavailable.
-#
-# apiVersion: autoscaling/v2
-# kind: HorizontalPodAutoscaler
-# metadata:
-#   name: worker-cpu
-#   namespace: llm-logs
-# spec:
-#   scaleTargetRef:
-#     apiVersion: apps/v1
-#     kind: Deployment
-#     name: worker
-#   minReplicas: 2
-#   maxReplicas: 10
-#   metrics:
-#     - type: Resource
-#       resource:
-#         name: cpu
-#         target:
-#           type: Utilization
-#           averageUtilization: 70
----
-# The API scales on CPU legitimately: it is request-driven and CPU-bound on
-# serialization and SSE fan-out.
+# Note that ingestion load does not translate into dropped telemetry under
+# pressure: producers spool to disk and replay, so a slow scale-up delays
+# events rather than losing them.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: backend-hpa
+  name: backend-cpu
   namespace: llm-logs
 spec:
   scaleTargetRef:
@@ -74,3 +28,7 @@ spec:
         target:
           type: Utilization
           averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Well above a request spike so traffic bursts do not thrash replicas.
+      stabilizationWindowSeconds: 300

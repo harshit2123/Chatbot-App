@@ -12,8 +12,8 @@ import uuid
 import pytest
 
 from app.config import Settings
-from app.sdk.logging import instrumented_stream
-from app.sdk.providers import ChatMessage, MockProvider, ProviderError, StreamChunk
+from app.telemetry.instrument import instrumented_stream
+from app.llm.providers import ChatMessage, MockProvider, ProviderError, StreamChunk
 
 
 @pytest.fixture
@@ -26,11 +26,14 @@ def settings() -> Settings:
 
 
 @pytest.fixture
-def captured(monkeypatch) -> list[dict]:
+def captured(settings) -> list[dict]:
+    """Capture emitted log events instead of sending them over HTTP."""
+    import llmlog
+    from app.telemetry.instrument import configure_telemetry
+
+    configure_telemetry(settings)
     events: list[dict] = []
-    monkeypatch.setattr(
-        "app.sdk.logging.emit_log_event", lambda event, settings: events.append(event)
-    )
+    llmlog.get_client().emit = events.append
     return events
 
 
@@ -65,7 +68,6 @@ def _run(provider, settings, should_cancel=None) -> list[StreamChunk]:
             provider=provider,
             model="m",
             messages=[ChatMessage(role="user", content="hello")],
-            settings=settings,
             conversation_id=str(uuid.uuid4()),
             should_cancel=should_cancel,
         )
@@ -143,7 +145,6 @@ def test_client_disconnect_midstream_is_logged(settings, captured):
         provider=StreamStub(["one", "two", "three", "four"]),
         model="m",
         messages=[ChatMessage(role="user", content="hello")],
-        settings=settings,
         conversation_id=str(uuid.uuid4()),
     )
 
@@ -172,7 +173,6 @@ def test_abandoned_generator_still_emits_exactly_one_log(settings, captured):
         provider=StreamStub(["a", "b", "c"]),
         model="m",
         messages=[ChatMessage(role="user", content="hello")],
-        settings=settings,
         conversation_id=str(uuid.uuid4()),
     )
     next(stream)
@@ -223,8 +223,8 @@ def test_ttft_is_captured_and_distinct_from_total_latency(settings, captured):
 
 def test_non_streaming_calls_have_no_ttft(settings, captured):
     """TTFT is meaningless for a blocking call — null, not zero, not latency."""
-    from app.sdk.logging import instrumented_completion
-    from app.sdk.providers import CompletionResult
+    from app.telemetry.instrument import instrumented_completion
+    from app.llm.providers import CompletionResult
 
     class Blocking:
         name = "blocking"
@@ -239,7 +239,6 @@ def test_non_streaming_calls_have_no_ttft(settings, captured):
         provider=Blocking(),
         model="m",
         messages=[ChatMessage(role="user", content="hello")],
-        settings=settings,
         conversation_id=str(uuid.uuid4()),
     )
 

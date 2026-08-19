@@ -19,3 +19,8 @@ dist/
 # Claude Code personal instructions
 CLAUDE.local.md
 .claude/settings.local.json
+
+# SDK build artifacts
+sdk/*.egg-info/
+sdk/build/
+sdk/dist/

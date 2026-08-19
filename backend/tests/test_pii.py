@@ -6,7 +6,7 @@ text into uselessness. Both are covered.
 
 import pytest
 
-from worker.pii import redact
+from app.telemetry.pii import redact
 
 
 @pytest.mark.parametrize(

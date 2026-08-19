@@ -26,7 +26,6 @@ def client():
     os.environ["LLM_PROVIDER"] = "mock"
     os.environ["LLM_MODEL"] = "mock/echo-1"
     # Write logs inline so assertions don't depend on a running broker.
-    os.environ["INGEST_SYNC"] = "true"
 
     from app.config import get_settings
     from app.db import session as session_module
@@ -38,7 +37,7 @@ def client():
     session_module.SessionLocal.configure(bind=engine)
 
     from app.main import app
-    from app.sdk import providers
+    from app.llm import providers
 
     reset_schema(TEST_DATABASE_URL)
 
@@ -46,18 +45,19 @@ def client():
     providers.MockProvider.chunk_delay_seconds = 0
 
     with TestClient(app) as test_client:
-        import app.sdk.logging as sdk_logging
+        import llmlog
 
-        original = sdk_logging.emit_log_event
+        log_client = llmlog.get_client()
+        original = log_client.emit
 
-        def emit_via_test_client(event, settings):
+        def emit_via_test_client(event):
             test_client.post("/ingest", json=event)
 
-        sdk_logging.emit_log_event = emit_via_test_client
+        log_client.emit = emit_via_test_client
         try:
             yield test_client
         finally:
-            sdk_logging.emit_log_event = original
+            log_client.emit = original
 
 
 @pytest.fixture
@@ -178,7 +178,7 @@ def test_stream_on_unknown_conversation_404s(client):
 
 def test_provider_error_is_reported_as_an_sse_error_frame(client, conversation_id, monkeypatch):
     """A mid-stream failure must reach the client, not hang the connection."""
-    from app.sdk.providers import ProviderError
+    from app.llm.providers import ProviderError
 
     def explode(settings):
         raise ProviderError("no credentials")

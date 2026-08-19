@@ -140,6 +140,3 @@ class ProviderBreakdown(BaseModel):
 class IngestAccepted(BaseModel):
     id: uuid.UUID
     accepted: bool = True
-    # False when the event was written inline — either because sync mode is on
-    # or because the broker was unreachable and we degraded rather than dropped.
-    queued: bool = True

@@ -111,9 +111,12 @@ spec:
       containers:
         - name: redis
           image: redis:7-alpine
-          # appendonly so queued log events survive a pod restart. The broker is
-          # the durability boundary between /ingest and Postgres.
-          args: ["redis-server", "--appendonly", "yes"]
+          # Redis now holds only short-TTL cancellation flags — log durability
+          # lives in the producer's on-disk spool, not here. Persistence is
+          # therefore unnecessary: a lost flag means at worst that one in-flight
+          # generation is not cancellable, and the code already falls back to
+          # process memory when Redis is unreachable.
+          args: ["redis-server", "--save", "", "--appendonly", "no"]
           ports:
             - containerPort: 6379
           volumeMounts:

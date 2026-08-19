@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from app.config import Settings
-from app.sdk.providers import (
+from app.llm.providers import (
     AnthropicProvider,
     ChatMessage,
     MockProvider,

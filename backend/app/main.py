@@ -4,6 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import llmlog
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import conversations, ingest, metrics
 from app.config import get_settings
-from app.sdk.logging import start_replay_worker
+from app.telemetry.instrument import configure_telemetry
 
 logging.basicConfig(level=logging.INFO)
 
@@ -38,10 +39,12 @@ def run_migrations() -> None:
 async def lifespan(app: FastAPI):
     run_migrations()
 
-    # Replay runs only in the background thread. Draining synchronously here
-    # would deadlock: the spool posts to this app's own /ingest endpoint, which
-    # cannot answer until startup completes.
-    start_replay_worker(get_settings())
+    # Point the telemetry SDK at this app's collector, then start the spool
+    # replay loop. Replay runs only in the background thread: draining
+    # synchronously here would deadlock, since the spool posts to this app's own
+    # /ingest endpoint, which cannot answer until startup completes.
+    configure_telemetry(get_settings())
+    llmlog.start_replay_worker()
 
     yield
 

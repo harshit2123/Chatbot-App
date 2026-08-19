@@ -13,9 +13,9 @@ import uuid
 import httpx
 import pytest
 
-from app.config import Settings
-from app.sdk.logging import emit_log_event, get_spool, replay_spooled_events
-from app.sdk.spool import EventSpool
+from llmlog.client import LogClient
+from llmlog.config import LogConfig
+from llmlog.spool import EventSpool
 
 
 @pytest.fixture
@@ -24,23 +24,15 @@ def spool_dir(tmp_path):
 
 
 @pytest.fixture
-def settings(spool_dir) -> Settings:
-    return Settings(
-        database_url="postgresql+psycopg://unused/unused",
-        ingest_url="http://ingest.invalid/ingest",
-        spool_enabled=True,
-        spool_dir=str(spool_dir),
+def client(spool_dir) -> LogClient:
+    """A throwaway client per test — no module-global state to reset."""
+    return LogClient(
+        LogConfig(
+            ingest_url="http://ingest.invalid/ingest",
+            spool_enabled=True,
+            spool_dir=str(spool_dir),
+        )
     )
-
-
-@pytest.fixture(autouse=True)
-def reset_spool_singleton():
-    """The spool is cached module-level; give each test a clean one."""
-    import app.sdk.logging as sdk_logging
-
-    sdk_logging._spool = None
-    yield
-    sdk_logging._spool = None
 
 
 def _event(**overrides) -> dict:
@@ -55,14 +47,13 @@ def _event(**overrides) -> dict:
     return {**base, **overrides}
 
 
-def _wait_for_delivery():
+def _wait_for_delivery(client: LogClient):
+    """Block until the client's background delivery pool has drained."""
     import time
-
-    import app.sdk.logging as sdk_logging
 
     deadline = time.time() + 5
     while time.time() < deadline:
-        if sdk_logging._delivery_pool._work_queue.empty():
+        if client._pool._work_queue.empty():
             time.sleep(0.1)
             return
         time.sleep(0.02)
@@ -73,20 +64,20 @@ def _wait_for_delivery():
 # --------------------------------------------------------------------------
 
 
-def test_event_survives_a_failed_delivery(settings, spool_dir, monkeypatch):
+def test_event_survives_a_failed_delivery(client, spool_dir, monkeypatch):
     """This is the whole point: ingestion down must not mean data lost."""
     monkeypatch.setattr(
         httpx, "post", lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("down"))
     )
 
-    emit_log_event(_event(), settings)
-    _wait_for_delivery()
+    client.emit(_event())
+    _wait_for_delivery(client)
 
     pending = list(spool_dir.glob("*.json"))
     assert len(pending) == 1, "a failed delivery must leave the event on disk"
 
 
-def test_spool_entry_is_removed_after_successful_delivery(settings, spool_dir, monkeypatch):
+def test_spool_entry_is_removed_after_successful_delivery(client, spool_dir, monkeypatch):
     """The spool must not grow without bound when everything is healthy."""
 
     class OK:
@@ -95,13 +86,13 @@ def test_spool_entry_is_removed_after_successful_delivery(settings, spool_dir, m
 
     monkeypatch.setattr(httpx, "post", lambda *a, **k: OK())
 
-    emit_log_event(_event(), settings)
-    _wait_for_delivery()
+    client.emit(_event())
+    _wait_for_delivery(client)
 
     assert list(spool_dir.glob("*.json")) == []
 
 
-def test_event_is_written_before_delivery_is_attempted(settings, spool_dir, monkeypatch):
+def test_event_is_written_before_delivery_is_attempted(client, spool_dir, monkeypatch):
     """Write-then-send, not send-then-write: a crash mid-POST must be recoverable."""
     observed: list[int] = []
 
@@ -112,8 +103,8 @@ def test_event_is_written_before_delivery_is_attempted(settings, spool_dir, monk
 
     monkeypatch.setattr(httpx, "post", post_spy)
 
-    emit_log_event(_event(), settings)
-    _wait_for_delivery()
+    client.emit(_event())
+    _wait_for_delivery(client)
 
     assert observed == [1]
 
@@ -124,14 +115,14 @@ def test_event_is_written_before_delivery_is_attempted(settings, spool_dir, monk
 
 
 def test_replay_delivers_pending_events_once_ingestion_recovers(
-    settings, spool_dir, monkeypatch
+    client, spool_dir, monkeypatch
 ):
     monkeypatch.setattr(
         httpx, "post", lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("down"))
     )
     for _ in range(3):
-        emit_log_event(_event(), settings)
-    _wait_for_delivery()
+        client.emit(_event())
+    _wait_for_delivery(client)
     assert len(list(spool_dir.glob("*.json"))) == 3
 
     class OK:
@@ -140,13 +131,13 @@ def test_replay_delivers_pending_events_once_ingestion_recovers(
 
     monkeypatch.setattr(httpx, "post", lambda *a, **k: OK())
 
-    assert replay_spooled_events(settings) == 3
+    assert client.replay() == 3
     assert list(spool_dir.glob("*.json")) == []
 
 
-def test_replay_stops_early_while_ingestion_is_still_down(settings, spool_dir, monkeypatch):
+def test_replay_stops_early_while_ingestion_is_still_down(client, spool_dir, monkeypatch):
     """Don't hammer a downed endpoint with the entire backlog every cycle."""
-    spool = get_spool(settings)
+    spool = client._spool
     for _ in range(5):
         spool.write(_event())
 
@@ -158,13 +149,13 @@ def test_replay_stops_early_while_ingestion_is_still_down(settings, spool_dir, m
 
     monkeypatch.setattr(httpx, "post", failing_post)
 
-    assert replay_spooled_events(settings) == 0
+    assert client.replay() == 0
     assert attempts["n"] == 1, "should stop after the first failure, not retry all 5"
     assert len(list(spool_dir.glob("*.json"))) == 5
 
 
 def test_permanently_rejected_event_is_discarded_not_retried_forever(
-    settings, spool_dir, monkeypatch
+    client, spool_dir, monkeypatch
 ):
     """A 422 will never become valid; keeping it would block the whole spool."""
 
@@ -174,13 +165,13 @@ def test_permanently_rejected_event_is_discarded_not_retried_forever(
 
     monkeypatch.setattr(httpx, "post", lambda *a, **k: Rejected())
 
-    emit_log_event(_event(), settings)
-    _wait_for_delivery()
+    client.emit(_event())
+    _wait_for_delivery(client)
 
     assert list(spool_dir.glob("*.json")) == [], "terminal rejection must clear the entry"
 
 
-def test_transient_5xx_keeps_the_event_for_retry(settings, spool_dir, monkeypatch):
+def test_transient_5xx_keeps_the_event_for_retry(client, spool_dir, monkeypatch):
     """A 503 is the server's problem, not the payload's — keep it."""
 
     class Unavailable:
@@ -189,8 +180,8 @@ def test_transient_5xx_keeps_the_event_for_retry(settings, spool_dir, monkeypatc
 
     monkeypatch.setattr(httpx, "post", lambda *a, **k: Unavailable())
 
-    emit_log_event(_event(), settings)
-    _wait_for_delivery()
+    client.emit(_event())
+    _wait_for_delivery(client)
 
     assert len(list(spool_dir.glob("*.json"))) == 1
 
@@ -200,8 +191,8 @@ def test_transient_5xx_keeps_the_event_for_retry(settings, spool_dir, monkeypatc
 # --------------------------------------------------------------------------
 
 
-def test_corrupt_spool_file_is_dropped_rather_than_blocking_replay(settings, spool_dir):
-    spool = get_spool(settings)
+def test_corrupt_spool_file_is_dropped_rather_than_blocking_replay(client, spool_dir):
+    spool = client._spool
     spool.write(_event())
 
     corrupt = spool_dir / "9999999999-corrupt.json"
@@ -212,9 +203,9 @@ def test_corrupt_spool_file_is_dropped_rather_than_blocking_replay(settings, spo
     assert not corrupt.exists()
 
 
-def test_spool_write_is_atomic_no_partial_files_visible(settings, spool_dir):
+def test_spool_write_is_atomic_no_partial_files_visible(client, spool_dir):
     """Readers must never see a half-written event."""
-    spool = get_spool(settings)
+    spool = client._spool
     for _ in range(20):
         spool.write(_event())
 
@@ -225,9 +216,9 @@ def test_spool_write_is_atomic_no_partial_files_visible(settings, spool_dir):
     assert list(spool_dir.glob("*.tmp")) == []
 
 
-def test_spool_enforces_a_capacity_ceiling(settings, spool_dir, monkeypatch):
+def test_spool_enforces_a_capacity_ceiling(client, spool_dir, monkeypatch):
     """A long outage must not fill the disk."""
-    import app.sdk.spool as spool_module
+    import llmlog.spool as spool_module
 
     monkeypatch.setattr(spool_module, "MAX_SPOOLED_EVENTS", 5)
     spool = EventSpool(spool_dir)
@@ -241,11 +232,12 @@ def test_spool_enforces_a_capacity_ceiling(settings, spool_dir, monkeypatch):
 
 def test_spooling_can_be_disabled(tmp_path, monkeypatch):
     """Opt-out must not break delivery."""
-    settings = Settings(
-        database_url="postgresql+psycopg://unused/unused",
-        ingest_url="http://ingest.invalid/ingest",
-        spool_enabled=False,
-        spool_dir=str(tmp_path / "unused"),
+    client = LogClient(
+        LogConfig(
+            ingest_url="http://ingest.invalid/ingest",
+            spool_enabled=False,
+            spool_dir=str(tmp_path / "unused"),
+        )
     )
 
     class OK:
@@ -254,16 +246,16 @@ def test_spooling_can_be_disabled(tmp_path, monkeypatch):
 
     monkeypatch.setattr(httpx, "post", lambda *a, **k: OK())
 
-    emit_log_event(_event(), settings)
-    _wait_for_delivery()
+    client.emit(_event())
+    _wait_for_delivery(client)
 
-    assert get_spool(settings) is None
+    assert client._spool is None
     assert not (tmp_path / "unused").exists()
 
 
-def test_a_broken_spool_directory_does_not_break_chat(settings, monkeypatch):
+def test_a_broken_spool_directory_does_not_break_chat(client, monkeypatch):
     """Logging failures must never propagate into the request path."""
-    import app.sdk.spool as spool_module
+    import llmlog.spool as spool_module
 
     def explode(*args, **kwargs):
         raise OSError("disk full")
@@ -277,5 +269,5 @@ def test_a_broken_spool_directory_does_not_break_chat(settings, monkeypatch):
     monkeypatch.setattr(httpx, "post", lambda *a, **k: OK())
 
     # Must not raise.
-    emit_log_event(_event(), settings)
-    _wait_for_delivery()
+    client.emit(_event())
+    _wait_for_delivery(client)

@@ -7,7 +7,7 @@ resources:
   - base.yaml
   - data.yaml
   - app.yaml
-  # Requires KEDA for the worker ScaledObject. Comment out if not installed.
+  # Plain CPU HPA; requires metrics-server. Comment out if not installed.
   - autoscale.yaml
 
 commonLabels:

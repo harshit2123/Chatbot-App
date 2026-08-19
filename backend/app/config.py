@@ -30,13 +30,9 @@ class Settings(BaseSettings):
     # receive these log events instead of this app.
     ingest_url: str = "http://127.0.0.1:8000/ingest"
 
-    # Broker/result backend for the log-processing queue, and the store for
-    # per-request cancellation flags.
+    # Store for per-request cancellation flags. Falls back to process memory
+    # when unreachable, so a single-process run still works without it.
     redis_url: str = "redis://localhost:6379/0"
-
-    # Bypass the queue and write logs inline. Useful for running the API
-    # standalone and for tests that assert on persisted rows.
-    ingest_sync: bool = False
 
     # Conversational context budget: how many past messages get replayed to the
     # model on each turn.
@@ -48,9 +44,9 @@ class Settings(BaseSettings):
 
     preview_max_chars: int = 500
 
-    # Durable on-disk spool for log events. Written before delivery is attempted
-    # and cleared on confirmed acceptance, so an ingestion outage or a crash
-    # cannot silently lose telemetry.
+    # Durable on-disk spool for log events, handed to the llmlog SDK. Written
+    # before delivery is attempted and cleared on confirmed acceptance, so an
+    # ingestion outage or a crash cannot silently lose telemetry.
     spool_enabled: bool = True
     spool_dir: str = "/tmp/llm-log-spool"
     spool_replay_interval_seconds: int = 30

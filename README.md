@@ -8,7 +8,7 @@ An **LLM observability platform** with a chatbot attached.
 The chatbot is the traffic generator; the system around it is the actual product.
 Every model call is automatically instrumented — provider, model, latency, token
 counts, status, errors, timestamps, and truncated input/output previews are captured,
-validated, queued, PII-redacted, persisted, and surfaced on a dashboard.
+validated, spooled durably, PII-redacted, persisted, and surfaced on a dashboard.
 
 The design goal driving every decision below: **telemetry must never degrade the
 product it measures.** Logging cannot slow chat down, cannot break it when the
@@ -53,7 +53,7 @@ docker compose up --build
 - Dashboard → http://localhost:5173 → "Observability"
 - API docs → http://localhost:8000/docs
 
-Five services start: `postgres`, `redis`, `backend`, `worker`, `frontend`.
+Four services start: `postgres`, `redis`, `backend`, `frontend`.
 
 The default provider is `mock` — no credentials, and it streams a reply reporting how
 much conversation context it received, so multi-turn behavior is visible immediately.
@@ -74,15 +74,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env
 .venv/bin/uvicorn app.main:app --reload
 
-# Worker, second shell
-cd backend && PYTHONPATH=..:. .venv/bin/celery -A worker.celery_app.celery_app worker --loglevel=info
-
 # Frontend, third shell
 cd frontend && npm install && npm run dev
 ```
 
-`INGEST_SYNC=true` bypasses the queue entirely and writes logs inline — useful for
-running the API without a broker.
+The telemetry SDK is a standalone package: `pip install -e ./sdk` installs it, and
+the backend imports it as `llmlog` like any third-party library.
 
 **Migrations** run automatically on startup (`alembic upgrade head`). To manage them
 by hand:
@@ -103,7 +100,7 @@ cd backend
 | 1 | Multi-turn chatbot, short context, simple UI | React chat with streaming, conversation list, and resume. History trimmed to the last `HISTORY_TURN_LIMIT` messages (default 20) before each call |
 | 2 | SDK capturing inference metadata, **auto-instrumenting** | One wrapper wraps every call. Provider adapters contain zero logging code — a new provider is instrumented for free |
 | 2 | Sends logs in near real time | Pushed over HTTP the moment a call terminates, not batched |
-| 3 | Ingestion: receive → validate → extract → store | `/ingest` receives and validates, then enqueues. The worker extracts, redacts, and stores — the four verbs are genuinely separate stages |
+| 3 | Ingestion: receive → validate → extract → store | `/ingest` receives, validates with Pydantic, redacts PII, and persists idempotently. Producers never block on it: the SDK spools to disk and delivers in the background |
 | 4 | Store messages, logs, extracted metadata | `conversations`, `messages`, `inference_logs`, with metadata in typed columns |
 
 ### Bonus items
@@ -113,9 +110,9 @@ cd backend
 | Multi-provider support | **Done** | Three adapters (`mock`, `openrouter`, `anthropic`) behind one interface. See [Multi-provider: the evidence](#multi-provider-the-evidence) |
 | Streaming responses | **Done** | SSE, token-by-token; verified incremental in a real browser |
 | Latency / throughput / error dashboards | **Done** | 5 aggregation endpoints + 3 charts + provider breakdown, aggregated in SQL |
-| Docker Compose one-command setup | **Done** | `docker compose up --build` brings up all 5 services from a wiped volume |
-| Event-based architecture | **Done** | `/ingest` enqueues to Redis and returns `queued: true`; Celery worker consumes |
-| PII redaction | **Done** | Applied in the worker before persistence; Luhn-validated cards, over-redaction guarded by tests |
+| Docker Compose one-command setup | **Done** | `docker compose up --build` brings up all 4 services from a wiped volume |
+| Event-based architecture | **Done** | Producers emit events asynchronously to a durable on-disk spool, delivered over HTTP and replayed until acknowledged — decoupling that survives a total collector outage |
+| PII redaction | **Done** | Applied on the ingestion path before persistence; Luhn-validated cards, over-redaction guarded by tests |
 | Deploy on self-hosted k8s | **Manifests written, not applied** | [`k8s/`](k8s/) — 15 resources, YAML-validated. No cluster was provisioned; treat as a design artifact. See [k8s/README.md](k8s/README.md) |
 
 ### Frontend requirements
@@ -142,28 +139,29 @@ cd backend
 │  FastAPI backend                    │           │
 │                                     │           │
 │  ┌───────────────────────────────┐  │           │
-│  │ SDK wrapper (instrumentation) │  │           │
-│  │  times call, builds log event │  │           │
+│  │ app/telemetry/instrument.py   │  │           │
+│  │  binds llmlog to this app's   │  │           │
+│  │  provider shapes              │  │           │
 │  └──────────────┬────────────────┘  │           │
 │                 │ calls             │           │
 │  ┌──────────────▼────────────────┐  │           │
-│  │ Provider adapter              │──┼──────────────► LLM provider
-│  │  mock │ OpenRouter            │  │           │    (Nvidia, Claude,
+│  │ app/llm/providers.py          │──┼──────────────► LLM provider
+│  │  mock │ OpenRouter │ Anthropic│  │           │    (Nvidia, Claude,
 │  │  no logging code inside       │  │           │     GPT, Gemini…)
 │  └───────────────────────────────┘  │           │
-│                                     │           │
-│  POST /ingest ── validate (Pydantic)│           │
-│         │                           │           │
-└─────────┼───────────────────────────┘           │
-          │ enqueue (returns immediately)         │
-          ▼                                       │
-┌─────────────────────┐                           │
-│  Redis (broker)     │                           │
-└─────────┬───────────┘                           │
-          │ consume                               │
-          ▼                                       │
+└─────────────────┬───────────────────┘           │
+                  │ llmlog.record(...)            │
+                  ▼                               │
 ┌─────────────────────────────────────┐           │
-│  Celery worker                      │           │
+│  llmlog SDK  (sdk/ — standalone)    │           │
+│   1. write event to disk spool      │           │
+│   2. POST from background thread    │           │
+│   3. replay until acknowledged      │           │
+└─────────────────┬───────────────────┘           │
+                  │ HTTP (never blocks the call)  │
+                  ▼                               │
+┌─────────────────────────────────────┐           │
+│  POST /ingest                       │           │
 │   validate → redact PII → persist   │           │
 └─────────┬───────────────────────────┘           │
           │ INSERT ... ON CONFLICT DO NOTHING     │
@@ -173,10 +171,14 @@ cd backend
 │  conversations · messages           │   SQL aggregation
 │  inference_logs                     │   (avg, p95, error rate)
 └─────────────────────────────────────┘
+
+Redis holds short-TTL cancellation flags only.
 ```
 
-Redis serves two unrelated purposes: Celery's broker, and the store for
-cancellation flags.
+The SDK is a standalone package with **no import of this application**. It never
+makes a model call and never sees a provider — it records that a call happened.
+That separation is what makes it liftable into any other codebase: `pip install
+llmlog`, point it at a collector, and instrument.
 
 ### The path of a single message
 
@@ -192,9 +194,10 @@ cancellation flags.
 6. **The stream terminates** — completed, failed, or cancelled. All three paths emit
    exactly one log event with the resolved provider/model, latency, tokens, status,
    and truncated previews.
-7. **The event is POSTed to `/ingest`**, which validates it and enqueues a Celery
-   task. No database write happens on the request path.
-8. **The worker** picks up the task, redacts PII, and inserts idempotently.
+7. **The event is written to the SDK's on-disk spool**, then POSTed to `/ingest`
+   from a background thread. The chat request never waits on either.
+8. **`/ingest` validates, redacts PII, and inserts idempotently.** The spool entry
+   is cleared only once the endpoint confirms acceptance.
 9. **The assistant reply is persisted** and the final SSE frame closes the stream.
 10. **The dashboard** aggregates in Postgres on demand.
 
@@ -202,11 +205,11 @@ cancellation flags.
 
 | Component | Owns | Deliberately does not |
 |---|---|---|
-| [`providers.py`](backend/app/sdk/providers.py) | Talking to LLM APIs, normalizing responses | Know that logging exists |
-| [`logging.py`](backend/app/sdk/logging.py) | Timing, metadata capture, log delivery | Know which provider it wraps |
+| [`llm/providers.py`](backend/app/llm/providers.py) | Talking to LLM APIs, normalizing responses | Know that logging exists |
+| [`sdk/llmlog/`](sdk/llmlog/) | Timing, durability, delivery, replay | Know what a provider or a model is |
+| [`telemetry/instrument.py`](backend/app/telemetry/instrument.py) | Binding the SDK to this app's provider shapes | Contain durability or transport logic |
 | [`conversations.py`](backend/app/api/conversations.py) | Chat orchestration, history trimming, SSE | Write log rows |
-| [`ingest.py`](backend/app/api/ingest.py) | Validating and enqueueing log events | Write to Postgres on the happy path |
-| [`tasks.py`](worker/tasks.py) | Redaction, normalization, persistence | Run on the request path |
+| [`ingest.py`](backend/app/api/ingest.py) | Validating, redacting, and persisting log events | Trust its input |
 | [`metrics.py`](backend/app/api/metrics.py) | SQL aggregation | Aggregate in Python |
 
 ### Why instrumentation is automatic
@@ -257,19 +260,29 @@ Details that matter:
 - **Replay stops at the first failure** rather than hammering a downed endpoint with
   the entire backlog every cycle.
 
-### Why ingestion is decoupled from storage
+### Why ingestion is decoupled from chat
 
-The naive version writes to Postgres inside the `/ingest` request. That couples your
-chat latency to your database health: a slow or briefly-unavailable Postgres makes
-the product slow, which is exactly backwards for telemetry.
+The naive version writes to Postgres inside the chat request. That couples chat
+latency to database health: a slow or briefly-unavailable Postgres makes the
+product slow, which is exactly backwards for telemetry.
 
-Instead `/ingest` validates and enqueues, returning `202 Accepted` in milliseconds.
-If the database is down, events wait in the broker until a worker drains them.
+The decoupling happens **in the producer**, not behind the collector. The SDK
+writes each event to an on-disk spool and delivers it from a background thread, so
+the chat request never waits on ingestion, on the database, or on the network.
 
-**Honest framing:** this is queue-based decoupling, **not** a durable replayable
-event log. Kafka or Redis Streams would give replay and event sourcing. Celery was
-chosen for delivery speed and operational familiarity — a real tradeoff, not a claim
-to be Kafka-grade streaming.
+**This replaced a Celery queue**, and the reasoning is worth stating plainly. The
+queue decoupled `/ingest` from Postgres — but the spool already decouples the
+*caller* from `/ingest`, one hop earlier, and it keeps working when the collector
+itself is down, which a broker sitting behind the collector cannot do. The queue
+was a second durability mechanism guarding a gap the first one already covered, at
+the cost of a broker to operate, a worker to scale, and a circular import between
+the API and the worker package. Removing it deleted a service and lost nothing.
+
+**Honest framing:** the spool is a durable local buffer with at-least-once
+delivery and idempotent writes — **not** a replayable event log. Kafka or Redis
+Streams would give you event sourcing and multiple independent consumers. If
+ingestion throughput ever became the real bottleneck, the honest next step is
+batching inserts at `/ingest`, not reintroducing a broker.
 
 ### Streaming
 
@@ -306,11 +319,9 @@ HTTP request.
 
 | Failure | Behavior |
 |---|---|
-| Malformed payload at the endpoint | `422`, nothing enqueued |
-| Malformed payload at the worker | Dropped as `dropped:invalid` — it will never become valid, so retrying would loop forever |
-| Worker dies mid-task | `acks_late` + `reject_on_worker_lost` redeliver it; the idempotent insert makes redelivery safe |
-| Postgres down | Task retries with backoff (max 3); events wait in the broker |
-| **Broker down** | `/ingest` degrades to a synchronous write rather than dropping the event, and reports `queued: false` |
+| Malformed payload at the endpoint | `422`; the producer treats it as terminal and drops it rather than retrying a payload that will never be accepted |
+| **Postgres down** | `/ingest` returns 5xx, which the producer treats as retryable — the event stays spooled on disk and is replayed once the database recovers |
+| Duplicate delivery after a retry | Harmless: the insert is `ON CONFLICT DO NOTHING` on the producer-supplied event id |
 | LLM call fails | Logged `status=error` with the provider's message, surfaced as an SSE `error` frame |
 | Generation cancelled | Logged `status=cancelled` with partial output preserved |
 | Ingestion endpoint unreachable | The event is already on the durable spool; a background loop replays it once ingestion recovers |
@@ -387,9 +398,9 @@ have been the easier default and the wrong one.
 
 ## PII redaction
 
-Applied **in the worker, before anything reaches durable storage**
-([`pii.py`](worker/pii.py)). Covers email, phone (international and NANP), credit
-cards, SSN, and IPv4.
+Applied **on the ingestion path, before anything reaches durable storage**
+([`pii.py`](backend/app/telemetry/pii.py)). Covers email, phone (international and
+NANP), credit cards, SSN, and IPv4.
 
 Two design points:
 
@@ -442,12 +453,11 @@ All via environment variables; see [`.env.example`](backend/.env.example).
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | local Postgres | Connection string |
-| `REDIS_URL` | `redis://localhost:6379/0` | Broker and cancellation flags |
+| `REDIS_URL` | `redis://localhost:6379/0` | Cancellation flags (falls back to process memory) |
 | `LLM_PROVIDER` | `mock` | `mock` or `openrouter` |
 | `LLM_MODEL` | `mock/echo-1` | Model id passed to the provider |
 | `OPENROUTER_API_KEY` | — | Required when provider is `openrouter` |
-| `INGEST_URL` | `http://127.0.0.1:8000/ingest` | Where the wrapper posts log events |
-| `INGEST_SYNC` | `false` | Bypass the queue, write logs inline |
+| `INGEST_URL` | `http://127.0.0.1:8000/ingest` | Where the SDK posts log events |
 | `SPOOL_ENABLED` | `true` | Durable on-disk spool for log events |
 | `SPOOL_DIR` | `/tmp/llm-log-spool` | Where spooled events are written |
 | `SPOOL_REPLAY_INTERVAL_SECONDS` | `30` | How often the replay loop drains the spool |
@@ -478,8 +488,13 @@ and others by changing `LLM_MODEL` alone. Free models carry a `:free` suffix.
 
 **Verification status:** verified end to end against live OpenRouter traffic using
 `nvidia/nemotron-3.5-lightning:free` — blocking calls, token-by-token SSE streaming,
-queue processing, and dashboard aggregation all confirmed in the browser. Error
+log processing, and dashboard aggregation all confirmed in the browser. Error
 handling was separately confirmed against a real 401.
+
+That browser run predates the removal of the Celery worker. The provider and
+streaming paths it exercised are unchanged, but the ingestion path has since been
+rewritten; it has been verified by the test suite and against a stub collector over
+real HTTP, not re-confirmed in a browser against a live provider.
 
 ---
 
@@ -556,7 +571,7 @@ A successful call with a valid Anthropic key. The request shape is confirmed cor
 by the 401, but the response parser has only been exercised against stubs and the
 error path — not a real 200.
 
-Switching providers requires no code change. The logging layer, queue, worker, and
+Switching providers requires no code change. The SDK, the ingestion path, and the
 dashboard are all provider-agnostic.
 
 ---
@@ -583,10 +598,9 @@ loudly.
 | `test_pii.py` | 18 | Email/phone/card/SSN/IP redaction, Luhn validation, **over**-redaction guards, redaction artifacts |
 | `test_api.py` | 15 | CRUD, rename, delete-keeps-logs, multi-turn ordering, validation, ingest idempotency |
 | `test_providers.py` | 14 | Anthropic vs OpenAI request/response shapes, normalized results, stream parsing, factory resolution |
-| `test_sdk_logging.py` | 8 | Wrapper: success, provider failure, unexpected exception, preview truncation, transport failure, non-2xx delivery, non-blocking delivery |
+| `test_sdk_logging.py` | 8 | Instrumentation: success, provider failure, unexpected exception, preview truncation, transport failure, non-2xx delivery, non-blocking delivery |
 | `test_streaming_api.py` | 8 | SSE frame sequence, persistence, resume, cancel, 404s, error frames |
 | `test_streaming.py` | 9 | Stream completion, cancellation with partial output, mid-stream errors, abandoned generators, stream/complete parity |
-| `test_worker.py` | 7 | Task persistence, redact-before-write, malformed payloads, redelivery idempotency, broker binding |
 | `test_metrics.py` | 7 | Aggregation correctness, fractional error rates, bucket ordering, empty windows |
 | `test_spool.py` | 12 | Write-before-send ordering, replay, terminal vs retryable status codes, corruption, capacity, disk failure |
 
@@ -597,18 +611,20 @@ rendering, and no console errors at any viewport.
 
 ### A bug worth documenting
 
-The queue silently was not being used. `@shared_task` binds to whichever Celery app is
-*current*, and the API only imported `worker.tasks` — so the task attached to Celery's
-**default** app pointing at `localhost`. Every enqueue from the API failed with
-"Connection refused" and fell through to the synchronous fallback.
+The queue silently was not being used. `@shared_task` binds to whichever Celery app
+is *current*, and the API only imported `worker.tasks` — so the task attached to
+Celery's **default** app pointing at `localhost`. Every enqueue from the API failed
+with "Connection refused" and fell through to the synchronous fallback.
 
 Redaction and persistence still worked, so the system looked correct end to end. Two
 things caught it: the `queued` flag in the ingest response, and checking the worker's
 logs for task activity rather than trusting that rows appeared in the database.
 
-Fixed by binding the task to the configured app explicitly. There is now a regression
-test asserting the task resolves a real broker URL — the kind of failure that is
-invisible without one.
+The lesson outlived the fix. That the system was fully correct for weeks with its
+queue silently bypassed is the clearest evidence that the queue was not carrying its
+weight — the durability it was supposed to provide was already coming from the
+producer's spool. The queue has since been removed entirely; see
+[Why ingestion is decoupled from chat](#why-ingestion-is-decoupled-from-chat).
 
 ---
 
@@ -646,43 +662,46 @@ started_at         2026-08-13T13:00:33.083492+00:00
 ```
 
 Supporting evidence: `grep` for logging calls inside
-[`providers.py`](backend/app/sdk/providers.py) and
+[`providers.py`](backend/app/llm/providers.py) and
 [`conversations.py`](backend/app/api/conversations.py) returns **no** matches
 outside docstrings. Neither the provider layer nor the API layer contains
 instrumentation — it lives entirely in the wrapper between them.
 
 ### Asynchronous ingestion
 
-The interesting property is not that a row eventually appears, but that it is
-**absent immediately after the endpoint returns**:
+The property that matters is that **the call being measured never waits for the
+measurement**. Verified against a stub collector, with the SDK talking real HTTP:
 
 ```
-POST /ingest  ->  {"accepted":true,"queued":true}
-rows immediately after 202:  0
-rows after the worker ran:   1
+streamed turn returns          -> caller unblocked, 0 network waits on the request path
+event delivered (background)   -> 1  status=success  ttft_ms set  tokens 7/4
+output_preview persisted as    -> "Hi there [REDACTED_EMAIL] call [REDACTED_PHONE]"
 ```
 
-Zero rows at the moment of the `202` proves the endpoint does no database work on
-the happy path. Confirmed in code: `ingest_log()` calls `process_log_event.delay()`
-and only touches Postgres via `_write_directly()` in sync mode or broker-down
-fallback.
+Delivery happens on a background thread after the spool write, so a slow or
+unreachable collector cannot appear as chat latency.
+
+### Durability across a collector outage
+
+The stronger claim — telemetry survives the collector being *down*, which is the
+case a queue behind the collector cannot help with:
+
+```
+collector returns 503          -> delivered 1  | spooled on disk 1   (event retained)
+collector recovers, replay()   -> replayed 1   | spool now 0         (event delivered)
+```
+
+The event was written to disk before delivery was attempted (`fsync` then atomic
+rename), held through the outage, and drained on recovery. Nothing was lost and
+nothing was double-written — the insert is idempotent on the producer-supplied id.
 
 ### Independent scaling
 
-Workers were scaled without touching the API, then 12 events enqueued:
-
-```
-docker compose up -d --scale worker=3 worker
-
-chatbotapp-worker-1 -> 7 tasks
-chatbotapp-worker-2 -> 3 tasks
-chatbotapp-worker-3 -> 3 tasks
-all 12 rows persisted
-```
-
-Work distributed across all three replicas from one Redis queue, with the backend
-untouched. This is what "ingestion and processing scale independently of the chat
-application" means concretely.
+Ingestion is a stateless idempotent insert, so it scales by adding backend
+replicas — see the HPA in [`k8s/autoscale.yaml`](k8s/autoscale.yaml). There is no
+separate consumer tier to scale any more, and under ingestion pressure producers
+spool and replay rather than dropping events, so a slow scale-up delays telemetry
+instead of losing it.
 
 ### Multi-provider
 
@@ -720,8 +739,7 @@ email [REDACTED_EMAIL] phone [REDACTED_PHONE] card [REDACTED_CARD] ssn [REDACTED
 - One reply produced **33 `event: delta` frames** — genuinely incremental, not a
   single buffered write.
 - All five `/metrics/*` endpoints return populated series from real traffic.
-- Five services run under Compose: `postgres`, `redis`, `backend`, `worker`,
-  `frontend`.
+- Four services run under Compose: `postgres`, `redis`, `backend`, `frontend`.
 
 ### Durable spool
 
@@ -765,10 +783,10 @@ Verification is only worth doing if it can fail. It did, four times:
    endpoint served by the same single-worker process while that process was busy
    streaming; the request timed out and the log was lost. Delivery now runs on a
    background thread pool.
-3. **Two suites silently skipped.** `test_api` and `test_worker` guarded on database
-   reachability and skipped — rather than failed — when their database was missing,
-   so a "59 passed" run was really 43 passed and 16 skipped. Each suite now creates
-   its own database.
+3. **Two suites silently skipped.** `test_api` and `test_metrics` guarded on
+   database reachability and skipped — rather than failed — when their database was
+   missing, so a "59 passed" run was really 43 passed and 16 skipped. Each suite now
+   creates its own database.
 4. **Redaction left cosmetic artifacts.** `+91 98765 43210` produced
    `+[REDACTED_PHONE]` (stray `+`), and a card followed by text produced
    `[REDACTED_CARD]ssn` (consumed separator). No PII leaked, but a redactor that
@@ -791,9 +809,9 @@ failure mode, and only checking the plumbing — not the output — surfaces it.
 
 ```bash
 docker compose up -d --build
-cd backend && .venv/bin/python -m pytest        # 98 tests
+pip install -e ./sdk                            # the telemetry SDK is standalone
+cd backend && .venv/bin/python -m pytest
 curl -s localhost:8000/metrics/summary?window_minutes=60
-docker compose logs worker | grep succeeded
 ```
 
 ---
@@ -802,25 +820,26 @@ docker compose logs worker | grep succeeded
 
 Deliberate scoping calls, stated plainly rather than hidden.
 
-- **No dead-letter queue.** Malformed tasks are logged and dropped rather than
-  parked somewhere reviewable.
-- **A client that disconnects mid-stream is not reliably logged.** When the browser
-  vanishes (tab closed, network drop), the ASGI server abandons the response
-  generator instead of closing it. Cleanup lives in a `finally`, which only runs
-  when Python finalizes the generator — and a reference cycle can delay that
-  indefinitely, so the log is sometimes written and sometimes not. Confirmed by
-  observing `/ingest` fire on some abandoned streams and not others.
+- **No dead-letter queue.** An event the collector rejects with a terminal 4xx is
+  logged and dropped rather than parked somewhere reviewable.
+- **A client that disconnects mid-stream depends on generator finalization.** When
+  the browser vanishes (tab closed, network drop), the ASGI server abandons the
+  response generator instead of closing it, and the `finally` that emits the log
+  runs only when Python finalizes it — which a reference cycle can delay.
+
+  This is now far less damaging than it was: the log event is written to the
+  durable spool the moment it is emitted, so a late finalization delays the event
+  rather than losing it. But emission still happens *at* stream termination, not
+  before the call. Writing a provisional record before the provider call and
+  completing it afterward would close the gap entirely.
 
   Cancel via the **Stop button works reliably** — that path sets a Redis flag the
-  stream loop checks, and never depends on finalization. The gap is specifically
-  the ungraceful disconnect.
-
-  The real fix is not more cleanup handlers: it is to stop treating in-process
-  cleanup as the delivery guarantee. Writing the log event to a durable local
-  spool *before* the provider call, then marking it complete afterward, makes an
-  abandoned stream a recoverable record rather than a lost one. That is the same
-  local-spool work listed above, and it subsumes this.
-- **Celery is a task queue, not a durable replayable event log.**
+  stream loop checks, and never depends on finalization.
+- **The spool is a durable local buffer, not a replayable event log.** It gives
+  at-least-once delivery from one producer; it does not give event sourcing or
+  multiple independent consumers the way Kafka or Redis Streams would.
+- **Ingestion writes one row per request.** Fine at this volume; batching inserts
+  is the first thing to do if it stops being fine.
 - **No auth or rate limiting** anywhere, including `/ingest`.
 - **The frontend image runs the Vite dev server** so `VITE_API_URL` stays
   runtime-configurable. Production would build the bundle and serve it behind nginx.
@@ -833,24 +852,28 @@ In priority order, with reasoning:
 
 1. **Auth and per-user scoping.** Requires the `users` table, and turns the dashboard
    into something you could expose to more than one team.
-2. **Dead-letter queue.** Malformed tasks are currently logged and dropped; parking
-   them somewhere reviewable is the difference between "we dropped it" and "we can
-   see what we dropped".
-3. **Kafka or Redis Streams** if replay or event sourcing becomes a requirement. Not
-   before — the queue is sufficient at current scale, and swapping it is contained to
-   one function.
-4. **Kubernetes — apply the manifests to a real cluster.** [`k8s/`](k8s/) contains a
-   complete set (Deployments, StatefulSets with PVCs, probes, initContainers, KEDA
-   queue-depth autoscaling) but they have not been run against a live cluster. The
+2. **A dead-letter path for terminally rejected events.** An event the collector
+   rejects with a 4xx is currently logged and dropped; parking it somewhere
+   reviewable is the difference between "we dropped it" and "we can see what we
+   dropped".
+3. **Batch inserts at `/ingest`** if write throughput becomes the real bottleneck —
+   the honest next step, and contained to one function.
+4. **Kafka or Redis Streams** if replay or event sourcing becomes a requirement. Not
+   before: that is a genuinely different guarantee from the spool's at-least-once
+   delivery, and worth adopting only when something actually needs it.
+5. **Kubernetes — apply the manifests to a real cluster.** [`k8s/`](k8s/) contains a
+   complete set (Deployments, StatefulSets with PVCs, probes, initContainers, a CPU
+   HPA) but they have not been run against a live cluster. The
    remaining work is provisioning one, loading images, and fixing whatever the first
    `kubectl apply` reveals — plus NetworkPolicies, managed Postgres/Redis, and real
    secret management before it is production-shaped.
 
 ### Scaling notes
 
-Workers scale horizontally — add replicas or raise `--concurrency`; Redis fans tasks
-out automatically. The API scales behind a load balancer, which the Redis-backed
-cancellation flags already account for.
+The API scales horizontally behind a load balancer, which the Redis-backed
+cancellation flags already account for. Ingestion scales with it, since the write is
+stateless and idempotent — and producers spool locally, so a scale-up lag delays
+telemetry rather than dropping it.
 
 The next real bottleneck is `inference_logs` growth. Metrics queries filter on
 `created_at`, so a time-based index comes first, then partitioning by time, then

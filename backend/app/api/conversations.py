@@ -23,8 +23,8 @@ from app.models.schemas import (
     MessageOut,
     SendMessageResponse,
 )
-from app.sdk.logging import instrumented_completion, instrumented_stream
-from app.sdk.providers import ChatMessage, ProviderError, build_provider
+from app.llm.providers import ChatMessage, ProviderError, build_provider
+from app.telemetry.instrument import instrumented_completion, instrumented_stream
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -188,7 +188,6 @@ def send_message(
             provider=provider,
             model=settings.llm_model,
             messages=context,
-            settings=settings,
             conversation_id=str(conversation_id),
             message_id=str(user_message.id),
         )
@@ -245,7 +244,6 @@ def stream_message(
                 provider=provider,
                 model=settings.llm_model,
                 messages=context,
-                settings=settings,
                 conversation_id=str(conversation_id),
                 message_id=user_message_id,
                 should_cancel=lambda: cancellation.is_cancelled(str(conversation_id)),

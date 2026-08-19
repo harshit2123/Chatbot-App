@@ -1,7 +1,7 @@
 """PII redaction applied before log previews are persisted.
 
 Regex-based rather than an ML recognizer (Presidio): predictable, dependency-free,
-and fast enough to run inline in the worker. The tradeoff is real — regexes catch
+and fast enough to run inline on the ingestion path. The tradeoff is real — regexes catch
 structured identifiers, not names, addresses, or free-form disclosure. Stated
 plainly in the README rather than implied to be complete.
 

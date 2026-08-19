@@ -25,7 +25,6 @@ pytestmark = pytest.mark.skipif(
 def client():
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
     os.environ["LLM_PROVIDER"] = "mock"
-    os.environ["INGEST_SYNC"] = "true"
 
     from app.config import get_settings
     from app.db import session as session_module

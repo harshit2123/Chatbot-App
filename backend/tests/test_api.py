@@ -31,10 +31,6 @@ def client():
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
     os.environ["LLM_PROVIDER"] = "mock"
     os.environ["LLM_MODEL"] = "mock/echo-1"
-    # Write logs inline so assertions about persisted rows don't depend on a
-    # running broker and worker. The queue path is covered in test_worker.py.
-    os.environ["INGEST_SYNC"] = "true"
-
     # Imported after env is set so settings/engine pick up the test database.
     from app.config import get_settings
     from app.db import session as session_module
@@ -53,19 +49,20 @@ def client():
         # Route the wrapper's log delivery into this test app instead of over
         # real HTTP to a dev server on port 8000, which would write to a
         # different database and fail the conversation foreign key.
-        import app.sdk.logging as sdk_logging
+        import llmlog
 
-        original_emit = sdk_logging.emit_log_event
+        log_client = llmlog.get_client()
+        original_emit = log_client.emit
 
-        def emit_via_test_client(event, settings):
+        def emit_via_test_client(event):
             response = test_client.post("/ingest", json=event)
             assert response.status_code == 202, response.text
 
-        sdk_logging.emit_log_event = emit_via_test_client
+        log_client.emit = emit_via_test_client
         try:
             yield test_client
         finally:
-            sdk_logging.emit_log_event = original_emit
+            log_client.emit = original_emit
 
 
 @pytest.fixture

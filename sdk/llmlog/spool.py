@@ -1,9 +1,9 @@
 """Durable local spool for log events.
 
-The gap this closes: the wrapper POSTs log events to the ingestion endpoint, and
-if that POST fails the event is gone. Everything *downstream* of `/ingest` is
-durable — validated, queued, retried, idempotently written — but the first hop
-was best-effort, so an ingestion outage silently lost observability data.
+The gap this closes: the client POSTs log events to a collector, and if that
+POST fails the event is gone. The collector's own write is durable — validated
+and idempotently persisted — but the first hop was best-effort, so a collector
+outage silently lost observability data.
 
 Design: write the event to disk **before** attempting delivery, delete the file
 on success, and replay leftovers in the background. A crash between write and
@@ -13,8 +13,8 @@ is a lost event with no trace.
 Deliberately a directory of JSON files rather than SQLite or a real WAL. One
 file per event is atomic via `os.rename`, needs no schema or locking, survives
 `kill -9`, and is trivially inspectable when debugging. The cost is filesystem
-overhead per event, which is irrelevant at the volume a single API process
-generates.
+overhead per event, which is irrelevant at the volume a single application
+process generates.
 """
 
 from __future__ import annotations

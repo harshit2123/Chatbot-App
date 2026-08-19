@@ -27,7 +27,7 @@ services:
 
   backend:
     build:
-      # Root context: the API imports the worker package to enqueue tasks.
+      # Root context: the image installs the standalone SDK from ./sdk.
       context: .
       dockerfile: backend/Dockerfile
     environment:
@@ -37,7 +37,7 @@ services:
       LLM_MODEL: ${LLM_MODEL:-mock/echo-1}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      # The wrapper posts to the ingestion endpoint over HTTP, same as it would
+      # The SDK posts to the ingestion endpoint over HTTP, same as it would
       # from a separate process. Self-referential inside the container network.
       INGEST_URL: http://127.0.0.1:8000/ingest
       CORS_ORIGINS: http://localhost:${FRONTEND_PORT:-5173},http://127.0.0.1:${FRONTEND_PORT:-5173}
@@ -45,19 +45,6 @@ services:
       # Host port is overridable so the stack still comes up when something
       # else on the machine already holds 8000.
       - "${BACKEND_PORT:-8000}:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-  worker:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
-    environment:
-      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/llmlogs
-      REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy
