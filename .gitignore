@@ -15,3 +15,7 @@ dist/
 # OS
 .DS_Store
 *.tsbuildinfo
+
+# Claude Code personal instructions
+CLAUDE.local.md
+.claude/settings.local.json
